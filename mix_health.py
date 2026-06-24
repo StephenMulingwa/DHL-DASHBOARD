@@ -123,13 +123,10 @@ def empty_health_dataframe() -> pd.DataFrame:
 
 
 def _fetch_group_assets(api_url: str, token: str, group_id: int) -> list[dict[str, Any]]:
-    import requests
-
-    from mix_client import _api_headers, _throttle_mix_api
+    from mix_client import _api_headers, _mix_http
 
     url = f"{api_url.rstrip('/')}/api/assets/group/{group_id}"
-    _throttle_mix_api()
-    resp = requests.get(url, headers=_api_headers(token), timeout=45)
+    resp = _mix_http("get", url, headers=_api_headers(token), timeout=45)
     if resp.status_code != 200:
         log.warning("MiX assets/group/%s failed: %s", group_id, resp.status_code)
         return []

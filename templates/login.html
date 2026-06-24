@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DHL Fleet Health — Sign in</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='dhl_logo.png') }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'] },
+          colors: {
+            dhl: {
+              red: '#D40511',
+              yellow: '#FFCC00',
+              dark: '#B0040E',
+            },
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    html, body { font-family: 'Inter', ui-sans-serif, system-ui, sans-serif; }
+    .login-root {
+      min-height: 100dvh;
+      max-height: 100dvh;
+      overflow: hidden;
+    }
+    @media (max-width: 1023px) {
+      .login-root {
+        max-height: none;
+        min-height: 100dvh;
+        overflow-y: auto;
+      }
+    }
+    @keyframes hero-kenburns {
+      0%   { transform: scale(1.05) translate(0, 0); }
+      50%  { transform: scale(1.12) translate(-1.5%, -1%); }
+      100% { transform: scale(1.05) translate(0.5%, 0.5%); }
+    }
+    .hero-animated {
+      animation: hero-kenburns 18s ease-in-out infinite alternate;
+      transform-origin: center center;
+    }
+    @keyframes sheen-sweep {
+      0%   { transform: translateX(-120%) skewX(-12deg); opacity: 0; }
+      40%  { opacity: 1; }
+      100% { transform: translateX(220%) skewX(-12deg); opacity: 0; }
+    }
+    .hero-sheen { animation: sheen-sweep 14s ease-in-out infinite; }
+    @keyframes ping-soft {
+      75%, 100% { transform: scale(2.2); opacity: 0; }
+    }
+    .ping-soft { animation: ping-soft 1.6s cubic-bezier(0,0,0.2,1) infinite; }
+    @keyframes spin-soft { to { transform: rotate(360deg); } }
+    .spin-soft { animation: spin-soft 0.9s linear infinite; }
+    @keyframes card-rise {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .card-rise { animation: card-rise 0.5s cubic-bezier(.2,.8,.2,1) both; }
+    .warm-check { display: none; }
+    .warm-check.show { display: block; }
+    .warm-spin.hidden-spin { display: none; }
+    .hero-headline {
+      color: #fff;
+      font-weight: 800;
+      text-shadow: 0 2px 16px rgba(0,0,0,0.55);
+    }
+    .hero-accent { color: #FFCC00; font-weight: 800; }
+    .hero-body { color: rgba(255,255,255,0.92); text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
+  </style>
+</head>
+<body class="bg-zinc-50 text-zinc-900 antialiased">
+  <div class="login-root grid min-h-0 grid-cols-1 lg:grid-cols-[1.25fr_minmax(300px,460px)] lg:h-[100dvh]">
+
+    <aside class="relative hidden min-h-0 overflow-hidden lg:block">
+      <div class="absolute inset-0 overflow-hidden">
+        <img src="{{ url_for('static', filename='dhl_image.jpg') }}"
+             alt="DHL logistics operations"
+             class="hero-animated absolute inset-0 h-full w-full object-cover" />
+      </div>
+      <div class="absolute inset-0"
+           style="background: linear-gradient(135deg, rgba(212,5,17,0.82) 0%, rgba(0,0,0,0.55) 55%, rgba(0,0,0,0.72) 100%);"></div>
+      <div class="absolute inset-0 bg-[radial-gradient(circle_at_30%_30%,rgba(255,204,0,0.25),transparent_55%)]"></div>
+      <div class="hero-sheen pointer-events-none absolute -inset-y-1/4 left-0 right-0 w-1/3 bg-gradient-to-r from-white/0 via-white/25 to-white/0"></div>
+
+      <div class="relative z-10 flex h-full min-h-0 flex-col justify-end p-8 pb-10 text-white">
+        <div class="max-w-xl space-y-3">
+          <span class="inline-flex items-center gap-2 rounded-full border border-yellow-300/40 bg-black/30 px-3 py-1 text-xs font-bold uppercase tracking-wider backdrop-blur-md">
+            <span class="relative flex h-2 w-2">
+              <span class="ping-soft absolute inline-flex h-full w-full rounded-full bg-yellow-300 opacity-75"></span>
+              <span class="relative inline-flex h-2 w-2 rounded-full bg-yellow-300"></span>
+            </span>
+            Live fleet health
+          </span>
+          <h1 class="hero-headline text-3xl leading-snug xl:text-4xl">
+            Monitor <span class="hero-accent">Real-Time Status</span> and <span class="hero-accent">Fleet Alarms</span> across DHL.
+          </h1>
+          <p class="hero-body max-w-lg text-sm font-medium leading-relaxed">
+            Overview, device drilldown, and 24-hour alarm analytics — powered by VSS telematics in one secure workspace.
+          </p>
+          <div class="flex flex-wrap gap-2 text-xs font-bold">
+            {% for tag in ["Overview", "Real-Time", "Alarms", "MiX Health"] %}
+              <span class="rounded-full border border-white/25 bg-black/25 px-3 py-1 backdrop-blur-md">{{ tag }}</span>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <section class="flex min-h-0 flex-col justify-center overflow-y-auto bg-white px-4 py-6 lg:max-h-[100dvh] lg:py-4 lg:pr-6">
+      <div class="mx-auto w-full max-w-[400px] shrink-0">
+        <div class="mb-4 flex justify-center">
+          <div class="flex w-fit max-w-full items-center gap-3 rounded-2xl border border-red-100 bg-white px-4 py-3 shadow-lg ring-1 ring-red-50">
+            <img src="{{ url_for('static', filename='dhl_logo.png') }}" alt="DHL" class="h-10 w-auto shrink-0 object-contain" />
+            <div class="min-w-0">
+              <p class="text-lg font-extrabold leading-tight text-dhl-red">DHL</p>
+              <p class="text-[11px] font-bold uppercase tracking-[0.18em] text-zinc-700">Fleet Health</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card-rise rounded-2xl border border-zinc-200 bg-white p-6 shadow-xl">
+          <div class="mb-5">
+            <span class="inline-flex items-center gap-1.5 rounded-full bg-red-50 px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-dhl-red">
+              Secure sign-in
+            </span>
+            <h2 class="mt-2 text-2xl font-extrabold text-zinc-900">Welcome back</h2>
+            <p class="mt-1 text-sm font-medium text-zinc-600">Sign in to access the DHL Fleet Health dashboard.</p>
+          </div>
+
+          <form id="login-form" method="post" action="{{ url_for('login') }}" class="space-y-4">
+            <label class="block text-sm font-semibold text-zinc-800">
+              Username
+              <input type="text" name="username" id="login-username" required autocomplete="username"
+                     class="mt-1 w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm font-medium focus:border-dhl-red focus:outline-none focus:ring-2 focus:ring-red-200" />
+            </label>
+            <label class="block text-sm font-semibold text-zinc-800">
+              Password
+              <input type="password" name="password" id="login-password" required autocomplete="current-password"
+                     class="mt-1 w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm font-medium focus:border-dhl-red focus:outline-none focus:ring-2 focus:ring-red-200" />
+            </label>
+
+            {% if error %}
+              <p class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-800" role="alert">{{ error }}</p>
+            {% endif %}
+
+            <button type="submit" id="login-submit"
+                    class="w-full rounded-lg bg-dhl-red px-4 py-2.5 text-sm font-bold text-white shadow-md transition hover:bg-dhl-dark focus:outline-none focus:ring-2 focus:ring-red-300">
+              Sign in
+            </button>
+          </form>
+
+          <div id="warm-panel" class="mt-4 hidden rounded-xl border border-yellow-200 bg-yellow-50 p-4">
+            <p class="mb-3 text-sm font-bold text-zinc-800">Preparing your workspace…</p>
+            <ul class="space-y-2 text-sm">
+              <li id="warm-1" class="warm-check flex items-center gap-2 font-medium text-zinc-700">
+                <span class="warm-spin inline-block h-4 w-4 rounded-full border-2 border-dhl-red border-t-transparent spin-soft"></span>
+                Verifying credentials
+              </li>
+              <li id="warm-2" class="warm-check flex items-center gap-2 font-medium text-zinc-700">
+                <span class="warm-spin inline-block h-4 w-4 rounded-full border-2 border-dhl-red border-t-transparent spin-soft"></span>
+                Connecting to VSS
+              </li>
+              <li id="warm-3" class="warm-check flex items-center gap-2 font-medium text-zinc-700">
+                <span class="warm-spin inline-block h-4 w-4 rounded-full border-2 border-dhl-red border-t-transparent spin-soft"></span>
+                Loading fleet data
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    document.getElementById('login-form')?.addEventListener('submit', function () {
+      const btn = document.getElementById('login-submit');
+      const panel = document.getElementById('warm-panel');
+      if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
+      if (panel) panel.classList.remove('hidden');
+      ['warm-1', 'warm-2', 'warm-3'].forEach((id, i) => {
+        setTimeout(() => document.getElementById(id)?.classList.add('show'), i * 400);
+      });
+    });
+  </script>
+</body>
+</html>

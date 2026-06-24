@@ -7,20 +7,37 @@ from typing import Iterable
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import html
 
 from data import RT_VIDEO_LOST_CHANNEL_MAX, parse_channels
 
 DHL_RED = "#D40511"
 DHL_YELLOW = "#FFCC00"
 DHL_GRAY = "#3B3B3B"
+CHART_BLUE = "#2563EB"
+CHART_GREEN = "#2E8B57"
+CHART_ORANGE = "#F97316"
+CHART_PURPLE = "#8B5CF6"
+CHART_CYAN = "#06B6D4"
+CHART_SLATE = "#64748B"
+COLORWAY = [CHART_BLUE, DHL_RED, CHART_GREEN, DHL_YELLOW, CHART_PURPLE, CHART_ORANGE, CHART_CYAN, CHART_SLATE]
 
 DEFAULT_LAYOUT = dict(
-    margin=dict(l=20, r=20, t=50, b=20),
-    paper_bgcolor="white",
-    plot_bgcolor="white",
-    font=dict(family="Inter, Segoe UI, Arial, sans-serif", size=13),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(l=42, r=26, t=68, b=52),
+    paper_bgcolor="#FFFFFF",
+    plot_bgcolor="#FFFFFF",
+    colorway=COLORWAY,
+    font=dict(family="Inter, Segoe UI, Arial, sans-serif", size=12, color="#334155"),
+    title_font=dict(size=17, color="#0F172A"),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.04,
+        xanchor="right",
+        x=1,
+        font=dict(size=11),
+        itemwidth=30,
+    ),
+    hoverlabel=dict(bgcolor="#0F172A", font=dict(color="#FFFFFF", size=12)),
 )
 
 EMPTY_FIG = go.Figure().update_layout(
@@ -49,17 +66,6 @@ def loading_fig(message: str) -> go.Figure:
         ],
         xaxis=dict(visible=False),
         yaxis=dict(visible=False),
-    )
-
-
-def kpi_card(title: str, value: str | int | float, *, accent: str = DHL_RED, sub: str | None = None) -> html.Div:
-    return html.Div(
-        className="kpi-card",
-        children=[
-            html.Div(title, className="kpi-title"),
-            html.Div(str(value), className="kpi-value", style={"color": accent}),
-            html.Div(sub or "", className="kpi-sub"),
-        ],
     )
 
 
@@ -92,7 +98,7 @@ def online_offline_pie(rt_df: pd.DataFrame, age_hours_threshold: float) -> go.Fi
         color=counts.index,
         color_discrete_map={"Online": "#2E8B57", "Offline": DHL_RED, "Status Unknown": "#999"},
     )
-    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_traces(textposition="inside", textinfo="percent+label", marker=dict(line=dict(color="#FFFFFF", width=2)))
     fig.update_layout(
         **DEFAULT_LAYOUT,
         title=f"Online vs Offline (Online = last seen <= {age_hours_threshold}h)",
@@ -105,7 +111,7 @@ def status_type_donut(rt_df: pd.DataFrame) -> go.Figure:
         return EMPTY_FIG
     counts = rt_df["StatusType"].fillna("Status Unknown").value_counts()
     fig = px.pie(names=counts.index, values=counts.values, hole=0.6)
-    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_traces(textposition="inside", textinfo="percent+label", marker=dict(line=dict(color="#FFFFFF", width=2)))
     fig.update_layout(**DEFAULT_LAYOUT, title="Detailed StatusType distribution")
     return fig
 
@@ -260,7 +266,7 @@ def alarm_type_pie(alarms_df: pd.DataFrame) -> go.Figure:
         return EMPTY_FIG
     counts = alarms_df["AlarmName"].fillna("Unknown").value_counts()
     fig = px.pie(names=counts.index, values=counts.values, hole=0.45)
-    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_traces(textposition="inside", textinfo="percent+label", marker=dict(line=dict(color="#FFFFFF", width=2)))
     fig.update_layout(**DEFAULT_LAYOUT, title="Alarms by type (last 24h)")
     return fig
 

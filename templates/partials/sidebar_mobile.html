@@ -1,0 +1,9 @@
+{% from 'partials/nav_icons.html' import nav_icon %}
+<nav class="mobile-tab-bar" aria-label="Main sections">
+  {% for item in nav_items %}
+    <a href="{{ item.href }}" class="mobile-tab-item{% if item.active %} active{% endif %}">
+      <span class="mt-ico nav-icon">{{ nav_icon(item.icon) }}</span>
+      <span class="mt-lbl">{{ item.label.split(' ')[0] }}</span>
+    </a>
+  {% endfor %}
+</nav>

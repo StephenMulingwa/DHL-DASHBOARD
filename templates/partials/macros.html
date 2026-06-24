@@ -1,0 +1,26 @@
+{% macro kpi_row(kpis) %}
+<div class="kpi-row">
+  {% for k in kpis %}
+    <div class="kpi-card" style="--kpi-accent: {{ k.border_accent or k.accent }}">
+      <div class="kpi-title">{{ k.title }}</div>
+      <div class="kpi-value">{{ k.value }}</div>
+      {% if k.sub %}<div class="kpi-sub">{{ k.sub }}</div>{% endif %}
+    </div>
+  {% endfor %}
+</div>
+{% endmacro %}
+
+{% macro page_header(title, subtitle) %}
+<div class="page-header">
+  <h1 class="page-title">{{ title }}</h1>
+  {% if subtitle %}<p class="page-subtitle">{{ subtitle }}</p>{% endif %}
+</div>
+{% endmacro %}
+
+{% macro render_banners(items) %}
+{% if items %}
+  {% for msg in items %}
+    <div class="banner banner-info">{{ msg }}</div>
+  {% endfor %}
+{% endif %}
+{% endmacro %}

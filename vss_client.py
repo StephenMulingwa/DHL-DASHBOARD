@@ -11,13 +11,15 @@ Credentials are read from environment variables; see .env.example / README.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,148 @@ USERNAME: str = _env("VSS_USERNAME", "mawa@controltech-ea.com")
 PASSWORD_PLAINTEXT: str = _env("VSS_PASSWORD", "Kenya+123")
 
 _TOKEN_FILE = Path(__file__).resolve().parent / ".vss_token.txt"
+_TOKEN_JSON_FILE = Path(__file__).resolve().parent / ".vss_token.json"
+
+
+@dataclass(frozen=True)
+class VssProfile:
+    name: str
+    base_url: str
+    username: str
+    password: str
+
+
+@dataclass(frozen=True)
+class _TokenRecord:
+    token: str
+    pid: str
+    issued_at: datetime | None = None
+    base_url: str | None = None
+    profile: str | None = None
+
+
+def _normalize_base_url(url: str) -> str:
+    return (url or "").strip().rstrip("/")
+
+
+_active_base_url: str = _normalize_base_url(BASE_URL) or BASE_URL
+_active_profile_name: str | None = None
+_LAST_VSS_ERROR: str | None = None
+
+
+def _credential_profiles() -> list[VssProfile]:
+    profiles: list[VssProfile] = []
+    primary_url = _normalize_base_url(_env("VSS_BASE_URL"))
+    primary_user = _env("VSS_USERNAME")
+    primary_pass = _env("VSS_PASSWORD")
+    if primary_url and primary_user and primary_pass:
+        profiles.append(VssProfile("primary", primary_url, primary_user, primary_pass))
+
+    secondary_url = _normalize_base_url(_env("VSS_BASE_URL_N"))
+    secondary_user = _env("VSS_USERNAME_N")
+    secondary_pass = _env("VSS_PASSWORD_N")
+    if secondary_url and secondary_user and secondary_pass:
+        profiles.append(VssProfile("secondary", secondary_url, secondary_user, secondary_pass))
+
+    prefer = _env("VSS_PREFERRED_PROFILE")
+    if prefer and len(profiles) > 1:
+        profiles.sort(key=lambda p: (0 if p.name == prefer else 1, p.name))
+
+    if profiles:
+        return profiles
+
+    # Legacy module defaults when env is empty.
+    if USERNAME and PASSWORD_PLAINTEXT:
+        profiles.append(
+            VssProfile(
+                "primary",
+                _normalize_base_url(BASE_URL) or BASE_URL,
+                USERNAME,
+                PASSWORD_PLAINTEXT,
+            )
+        )
+    return profiles
+
+
+def active_base_url() -> str:
+    return _active_base_url or _normalize_base_url(BASE_URL) or BASE_URL
+
+
+def last_vss_profile() -> str | None:
+    return _active_profile_name
+
+
+def last_vss_error() -> str | None:
+    return _LAST_VSS_ERROR
+
+
+def _set_last_vss_error(msg: str | None) -> None:
+    global _LAST_VSS_ERROR
+    _LAST_VSS_ERROR = (msg or "").strip() or None
+
+
+def _set_active_profile(profile: VssProfile) -> None:
+    global _active_base_url, _active_profile_name
+    _active_base_url = profile.base_url
+    _active_profile_name = profile.name
+
+
+def _ssl_verify_for_url(base_url: str) -> bool:
+    explicit = _env("VSS_SSL_VERIFY")
+    if explicit:
+        return _env_truthy("VSS_SSL_VERIFY")
+    if base_url.startswith("https://") and "controltech" in base_url.lower():
+        return False
+    return True
+
+
+def _token_ttl_hours() -> float:
+    try:
+        return max(1.0, float(_env("VSS_TOKEN_TTL_HOURS", "23") or "23"))
+    except ValueError:
+        return 23.0
+
+
+def _parse_issued_at(raw: str | int | float | None) -> datetime | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        except (OSError, ValueError, OverflowError):
+            return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def _token_is_expired(issued_at: datetime | None) -> bool:
+    if issued_at is None:
+        return bool(_credential_profiles())
+    ttl = timedelta(hours=_token_ttl_hours())
+    now = datetime.now(timezone.utc)
+    if issued_at.tzinfo is None:
+        issued_at = issued_at.replace(tzinfo=timezone.utc)
+    return now - issued_at >= ttl
+
+
+def _token_file_mtime() -> float | None:
+    for path in (_TOKEN_JSON_FILE, _TOKEN_FILE):
+        if path.is_file():
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                continue
+    return None
 
 _vss_log = logging.getLogger("vss_client")
 
@@ -46,6 +190,8 @@ _session.mount("http://", HTTPAdapter(pool_connections=_POOL_MAXSIZE, pool_maxsi
 _session.mount("https://", HTTPAdapter(pool_connections=_POOL_MAXSIZE, pool_maxsize=_POOL_MAXSIZE))
 
 _lock = threading.Lock()
+_vss_api_lock = threading.Lock()
+_discover_lock = threading.Lock()
 _VSS_TOKEN: str | None = None
 _VSS_PID: str | None = None
 _VSS_TOKEN_AT: datetime | None = None
@@ -54,6 +200,7 @@ _LAST_TOKEN_SOURCE: str | None = None
 # Mtime of ``.vss_token.txt`` when the in-memory token was last aligned with that file
 # (used to pick up hand-edited tokens without restarting the process).
 _FILE_TOKEN_MTIME: float | None = None
+_LAST_10082_AT: float | None = None
 
 
 def md5_hex(s: str) -> str:
@@ -73,22 +220,25 @@ def _reset_session() -> None:
 
 
 def vss_post_raw(path: str, payload: dict, timeout: int = 25, max_attempts: int = 5) -> dict:
-    url = f"{BASE_URL}{path}"
+    base = active_base_url()
+    url = f"{base}{path}"
+    verify = _ssl_verify_for_url(base)
     delay_s = 1.0
     last_exc: Exception | None = None
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            r = _session.post(url, json=payload, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            last_exc = e
-            if attempt == max_attempts:
-                raise
-            time.sleep(delay_s)
-            delay_s = min(delay_s * 1.8, 10.0)
-            _reset_session()
+    with _vss_api_lock:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = _session.post(url, json=payload, timeout=timeout, verify=verify)
+                r.raise_for_status()
+                return r.json()
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                if attempt == max_attempts:
+                    raise
+                time.sleep(delay_s)
+                delay_s = min(delay_s * 1.8, 10.0)
+                _reset_session()
 
     if last_exc:
         raise last_exc
@@ -114,6 +264,25 @@ def vss_post(path: str, payload: dict, timeout: int = 25, max_wait_seconds: int 
 
 
 def _load_token_from_file() -> tuple[str, str] | None:
+    rec = _load_token_record()
+    return (rec.token, rec.pid) if rec else None
+
+
+def _load_token_record() -> _TokenRecord | None:
+    if _TOKEN_JSON_FILE.is_file():
+        try:
+            data = json.loads(_TOKEN_JSON_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                tok = str(data.get("token") or "").strip()
+                pid = str(data.get("pid") or "").strip()
+                issued_at = _parse_issued_at(data.get("issued_at"))
+                base_url = _normalize_base_url(str(data.get("base_url") or "")) or None
+                profile = str(data.get("profile") or "").strip() or None
+                if tok:
+                    return _TokenRecord(tok, pid, issued_at, base_url, profile)
+        except Exception:
+            pass
+
     if not _TOKEN_FILE.is_file():
         return None
     try:
@@ -123,68 +292,181 @@ def _load_token_from_file() -> tuple[str, str] | None:
         parts = lines[0].split()
         tok = parts[0].strip()
         pid = parts[1].strip() if len(parts) > 1 else ""
-        # Common hand-edit: token on line 1, pid alone on line 2 (save format is one line).
         if not pid and len(lines) > 1:
             pid = lines[1].strip()
-        return (tok, pid) if tok else None
+        if not tok:
+            return None
+        return _TokenRecord(tok, pid, None, None, None)
     except Exception:
         return None
 
 
-def _save_token_to_file(token: str, pid: str) -> None:
+def _save_token_to_file(
+    token: str,
+    pid: str,
+    *,
+    issued_at: datetime | None = None,
+    base_url: str | None = None,
+    profile: str | None = None,
+) -> None:
+    when = issued_at or datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    payload: dict[str, str] = {
+        "token": token,
+        "pid": pid,
+        "issued_at": when.isoformat(),
+    }
+    store_base = base_url or active_base_url()
+    store_profile = profile or _active_profile_name
+    if store_base:
+        payload["base_url"] = store_base
+    if store_profile:
+        payload["profile"] = store_profile
     try:
+        _TOKEN_JSON_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         _TOKEN_FILE.write_text(f"{token} {pid}\n", encoding="utf-8")
     except Exception:
         pass
 
 
-def login_with_backoff(max_wait_seconds: int = 60) -> tuple[str, str]:
-    """Log in via apiLogin, backing off on 10082 without hammering the endpoint.
+def _login_and_persist(
+    *,
+    login_max_wait_seconds: int | None = None,
+    allow_10082_retry: bool = False,
+) -> tuple[str, str]:
+    if login_max_wait_seconds is not None:
+        max_wait = max(30, int(login_max_wait_seconds))
+    else:
+        max_wait = int(float(_env("VSS_LOGIN_MAX_WAIT", "600") or "600"))
+        max_wait = max(120, max_wait)
+    token, pid = login_with_backoff(max_wait_seconds=max_wait, allow_10082_retry=allow_10082_retry)
+    now = datetime.now(timezone.utc)
+    _save_token_to_file(token, pid, issued_at=now)
+    _set_last_vss_error(None)
+    _vss_log.info("VSS token saved to .vss_token.json (profile=%s)", _active_profile_name or "?")
+    return token, pid
 
-    **Important:** every `apiLogin` attempt counts toward VSS rate limits. Short
-    retry loops (5s, 8s, …) keep you stuck in 10082. On 10082 we wait **at
-    least** `VSS_10082_SLEEP_SEC` (default 120s) before trying again.
-    """
-    started = time.time()
+
+def _api_login(profile: VssProfile, *, timeout: int = 30) -> dict:
+    url = f"{profile.base_url}/vss/user/apiLogin.action"
+    verify = _ssl_verify_for_url(profile.base_url)
+    with _vss_api_lock:
+        r = _session.post(
+            url,
+            json={"username": profile.username, "password": md5_hex(profile.password)},
+            timeout=timeout,
+            verify=verify,
+        )
+    r.raise_for_status()
+    return r.json()
+
+
+def _login_cooldown_active() -> bool:
+    if _LAST_10082_AT is None:
+        return False
+    try:
+        cooldown = float(_env("VSS_10082_COOLDOWN_SEC", "600") or "600")
+    except ValueError:
+        cooldown = 600.0
+    return time.time() - _LAST_10082_AT < max(120.0, cooldown)
+
+
+def _mark_10082() -> None:
+    global _LAST_10082_AT
+    _LAST_10082_AT = time.time()
+
+
+def login_with_backoff(max_wait_seconds: int = 60, *, allow_10082_retry: bool = False) -> tuple[str, str]:
+    """Log in via apiLogin across configured profiles, backing off on 10082."""
+    if _login_cooldown_active() and not allow_10082_retry:
+        wait = max(0.0, float(_env("VSS_10082_COOLDOWN_SEC", "600") or "600") - (time.time() - (_LAST_10082_AT or 0)))
+        msg = (
+            f"VSS login temporarily blocked after rate-limit (10082). "
+            f"Wait ~{int(wait)}s or paste a fresh token+pid into .vss_token.json."
+        )
+        _set_last_vss_error(msg)
+        raise RuntimeError(msg)
+
+    profiles = _credential_profiles()
+    if not profiles:
+        msg = "No VSS credential profiles configured (set VSS_* or VSS_*_N in .env)"
+        _set_last_vss_error(msg)
+        raise RuntimeError(msg)
+
     cool_10082 = float(_env("VSS_10082_SLEEP_SEC", "120") or "120")
     cool_10082 = max(60.0, cool_10082)
-    while True:
-        j = vss_post_raw(
-            "/vss/user/apiLogin.action",
-            {"username": USERNAME, "password": md5_hex(PASSWORD_PLAINTEXT)},
-            timeout=25,
-            max_attempts=3,
-        )
-        if j.get("status") == 10000 and isinstance(j.get("data"), dict):
-            data = j["data"]
-            tok = str(data.get("token") or "")
-            pid = str(data.get("pid") or "")
-            return tok, pid
-        if j.get("status") == 10082:
-            # When a hand-pasted token file exists, apiLogin will keep failing for ~10 min — fail fast.
-            if _load_token_from_file() and not _env_truthy("VSS_10082_RETRY_LOGIN"):
-                raise RuntimeError(
-                    "VSS login rate-limited (10082). Paste a fresh browser token into "
-                    ".vss_token.txt and click Refresh — do not call apiLogin until the lockout clears. "
-                    f"full={j}"
+    errors: list[str] = []
+
+    for profile_idx, profile in enumerate(profiles):
+        started = time.time()
+        while True:
+            try:
+                j = _api_login(profile)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                errors.append(f"{profile.name}: connection error ({exc})")
+                break
+
+            status = j.get("status")
+            if status == 10000 and isinstance(j.get("data"), dict):
+                data = j["data"]
+                tok = str(data.get("token") or "")
+                pid = str(data.get("pid") or "")
+                _set_active_profile(profile)
+                _vss_log.info(
+                    "VSS login OK via %s (%s), token stored for %.0fh",
+                    profile.name,
+                    profile.base_url,
+                    _token_ttl_hours(),
                 )
-            elapsed = time.time() - started
-            if elapsed >= max_wait_seconds:
-                raise RuntimeError(
-                    f"VSS login rate-limited (10082) after {int(elapsed)}s. "
-                    f"Stop all dashboards/notebooks using this account for ~10 min, "
-                    f"put a token in .vss_token.txt or VSS_TOKEN, then retry. full={j}"
+                return tok, pid
+
+            if status == 10001:
+                msg = f"{profile.name} ({profile.base_url}): wrong username/password"
+                _vss_log.warning("VSS login failed (10001) — %s", msg)
+                errors.append(msg)
+                break
+
+            if status == 10082:
+                _mark_10082()
+                if (
+                    _load_token_from_file()
+                    and not _env_truthy("VSS_10082_RETRY_LOGIN")
+                    and not allow_10082_retry
+                ):
+                    msg = (
+                        f"VSS login rate-limited (10082) on {profile.name}. "
+                        "Use stored .vss_token.json or wait ~10 min."
+                    )
+                    _set_last_vss_error(msg)
+                    raise RuntimeError(f"{msg} full={j}")
+                elapsed = time.time() - started
+                if elapsed >= max_wait_seconds:
+                    msg = f"VSS login rate-limited (10082) on {profile.name} after {int(elapsed)}s"
+                    errors.append(msg)
+                    break
+                wait = min(cool_10082, max(0.0, max_wait_seconds - elapsed - 1.0))
+                if wait < 5.0:
+                    errors.append(f"{profile.name}: 10082 lockout, not enough wait budget left")
+                    break
+                _vss_log.warning(
+                    "VSS profile %s rate-limited (10082) — waiting %.0fs before retry",
+                    profile.name,
+                    wait,
                 )
-            # Long quiet period so we don't extend VSS lockout with rapid logins.
-            wait = min(cool_10082, max(0.0, max_wait_seconds - elapsed - 1.0))
-            if wait < 5.0:
-                raise RuntimeError(
-                    f"VSS login rate-limited (10082); not enough time left in budget ({max_wait_seconds}s). "
-                    f"Increase VSS_LOGIN_MAX_WAIT or wait without calling apiLogin. full={j}"
-                )
-            time.sleep(wait)
-            continue
-        raise RuntimeError(f"VSS login failed status={j.get('status')} msg={j.get('msg')} full={j}")
+                time.sleep(wait)
+                continue
+
+            msg = f"{profile.name}: status={status} msg={j.get('msg')}"
+            errors.append(msg)
+            break
+
+        if profile_idx < len(profiles) - 1:
+            _vss_log.info("Trying next VSS credential profile…")
+
+    combined = "; ".join(errors) or "all profiles failed"
+    _set_last_vss_error(combined)
+    raise RuntimeError(f"VSS login failed for all profiles: {combined}")
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -192,15 +474,28 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     return v in ("1", "true", "yes", "on")
 
 
-def _vss_credentials_in_env() -> bool:
-    """True when ``VSS_USERNAME`` and ``VSS_PASSWORD`` are both set in the process environment.
+def _has_persisted_token() -> bool:
+    return _TOKEN_JSON_FILE.is_file() or _TOKEN_FILE.is_file()
 
-    Used to recover from 10023 via ``apiLogin`` after a stale ``.vss_token.txt`` would
-    otherwise block login (file is normally preferred over ``apiLogin``).
-    """
-    u = os.environ.get("VSS_USERNAME", "")
-    p = os.environ.get("VSS_PASSWORD", "")
-    return bool(str(u).strip() and str(p).strip())
+
+def _stored_token_issued_at() -> datetime | None:
+    rec = _load_token_record()
+    if rec and rec.issued_at:
+        return rec.issued_at
+    return _VSS_TOKEN_AT
+
+
+def _stored_token_within_ttl() -> bool:
+    """True when saved token+pid is still inside the 23h reuse window."""
+    issued_at = _stored_token_issued_at()
+    if issued_at is None:
+        return True
+    return not _token_is_expired(issued_at)
+
+
+def _vss_credentials_in_env() -> bool:
+    """True when at least one VSS credential profile is configured."""
+    return bool(_credential_profiles())
 
 
 _thread_ctx = threading.local()
@@ -239,19 +534,83 @@ def try_token_without_login() -> tuple[str, str] | None:
         if env_tok:
             _LAST_TOKEN_SOURCE = "env"
             _FILE_TOKEN_MTIME = None
-            _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = env_tok, env_pid, datetime.now()
+            _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = env_tok, env_pid, datetime.now(timezone.utc)
             return _VSS_TOKEN, _VSS_PID or ""
 
-        cached = _load_token_from_file()
-        if cached:
-            _LAST_TOKEN_SOURCE = "file"
-            _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = cached[0], cached[1], datetime.now()
-            try:
-                _FILE_TOKEN_MTIME = _TOKEN_FILE.stat().st_mtime
-            except OSError:
-                _FILE_TOKEN_MTIME = None
-            return _VSS_TOKEN, _VSS_PID or ""
+        rec = _load_token_record()
+        if rec:
+            return _apply_token_record(rec, source="file")
     return None
+
+
+def _apply_token_record(
+    rec: _TokenRecord,
+    *,
+    source: str,
+) -> tuple[str, str]:
+    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE, _FILE_TOKEN_MTIME
+    global _active_base_url, _active_profile_name
+    _LAST_TOKEN_SOURCE = source
+    _VSS_TOKEN, _VSS_PID = rec.token, rec.pid
+    issued_at = rec.issued_at
+    mt = _token_file_mtime()
+    if mt is not None:
+        file_dt = datetime.fromtimestamp(mt, tz=timezone.utc)
+        if issued_at is None:
+            issued_at = file_dt
+        else:
+            if issued_at.tzinfo is None:
+                issued_at = issued_at.replace(tzinfo=timezone.utc)
+            if file_dt > issued_at + timedelta(seconds=2):
+                issued_at = file_dt
+    _VSS_TOKEN_AT = issued_at or datetime.now(timezone.utc)
+    if rec.base_url:
+        _active_base_url = rec.base_url
+    if rec.profile:
+        _active_profile_name = rec.profile
+    _FILE_TOKEN_MTIME = mt
+    _set_last_vss_error(None)
+    return _VSS_TOKEN, _VSS_PID or ""
+
+
+def _memory_token_expired() -> bool:
+    if not _VSS_TOKEN:
+        return False
+    return _token_is_expired(_VSS_TOKEN_AT)
+
+
+def refresh_token_if_expired(*, login_max_wait_seconds: int | None = None) -> bool:
+    """Proactively refresh stored token when age >= VSS_TOKEN_TTL_HOURS (default 23h)."""
+    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE, _FILE_TOKEN_MTIME
+
+    if _env("VSS_TOKEN"):
+        return False
+
+    with _lock:
+        issued_at = _stored_token_issued_at()
+        if not _token_is_expired(issued_at):
+            return False
+        if _vss_no_login():
+            return False
+        if not _vss_credentials_in_env():
+            return False
+        try:
+            token, pid = _login_and_persist(
+                login_max_wait_seconds=login_max_wait_seconds,
+                allow_10082_retry=True,
+            )
+        except Exception as exc:
+            _vss_log.warning("token refresh failed: %s", exc)
+            return False
+        _LAST_TOKEN_SOURCE = "login"
+        now = datetime.now(timezone.utc)
+        _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = token, pid, now
+        try:
+            _FILE_TOKEN_MTIME = _TOKEN_JSON_FILE.stat().st_mtime
+        except OSError:
+            _FILE_TOKEN_MTIME = None
+        _vss_log.info("VSS token refreshed proactively (TTL %.0fh)", _token_ttl_hours())
+        return True
 
 
 def ensure_token(
@@ -259,36 +618,36 @@ def ensure_token(
     force: bool = False,
     skip_file: bool = False,
     login_max_wait_seconds: int | None = None,
+    allow_10082_retry: bool = False,
 ) -> tuple[str, str]:
-    """Return the *same* token across all refresh cycles.
-
-    VSS keeps a session alive for 30 minutes of inactivity, and the dashboard
-    auto-refreshes every 5 minutes — so once we have a token we keep using it
-    until the server itself says it's invalid (status 10023). At that point
-    `_retry_on_session_expired` will pass `force=True` to re-check env/file and
-    only then log in once.
+    """Return the active VSS token.
 
     Lookup order (when no in-memory token exists yet, or ``force=True``):
 
       1) ``VSS_TOKEN`` env var
-      2) ``.vss_token.txt`` file (skipped when ``skip_file=True``)
-      3) login with backoff (handles 10082)
+      2) ``.vss_token.json`` / ``.vss_token.txt`` (preferred when present)
+      3) apiLogin via ``VSS_*`` / ``VSS_*_N`` profiles in ``.env`` (saved to json)
+
+    Set ``skip_file=True`` to force step 3 (used when stored token returns 10023).
     """
     global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE, _FILE_TOKEN_MTIME
 
     with _lock:
         # PID may be empty on some responses; token alone must still count as a session.
         if not force and _VSS_TOKEN:
-            if _FILE_TOKEN_MTIME is not None and _TOKEN_FILE.is_file():
+            mt = _token_file_mtime()
+            if _FILE_TOKEN_MTIME is not None and mt is not None:
                 try:
-                    if _TOKEN_FILE.stat().st_mtime > _FILE_TOKEN_MTIME:
+                    if mt > _FILE_TOKEN_MTIME:
                         _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = None, None, None
                         _FILE_TOKEN_MTIME = None
                 except OSError:
                     pass
-            if _VSS_TOKEN:
+            if _VSS_TOKEN and not _memory_token_expired():
                 _LAST_TOKEN_SOURCE = "memory"
                 return _VSS_TOKEN, _VSS_PID or ""
+            if _VSS_TOKEN and _memory_token_expired() and not _vss_no_login() and _vss_credentials_in_env():
+                _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = None, None, None
 
         if force:
             # Drop the stale in-memory token so a newly pasted env/file token can take over
@@ -301,38 +660,39 @@ def ensure_token(
         if env_tok:
             _LAST_TOKEN_SOURCE = "env"
             _FILE_TOKEN_MTIME = None
-            _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = env_tok, env_pid, datetime.now()
+            _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = env_tok, env_pid, datetime.now(timezone.utc)
             return _VSS_TOKEN, _VSS_PID or ""
 
         if not skip_file:
-            cached = _load_token_from_file()
-            if cached:
-                _LAST_TOKEN_SOURCE = "file"
-                _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = cached[0], cached[1], datetime.now()
-                try:
-                    _FILE_TOKEN_MTIME = _TOKEN_FILE.stat().st_mtime
-                except OSError:
-                    _FILE_TOKEN_MTIME = None
-                return _VSS_TOKEN, _VSS_PID or ""
+            rec = _load_token_record()
+            if rec:
+                return _apply_token_record(rec, source="file")
 
         if _vss_no_login():
+            rec = _load_token_record()
+            if rec:
+                return _apply_token_record(rec, source="file")
             raise RuntimeError(
                 "VSS token not available for refresh (no apiLogin in refresh mode). "
-                "The dashboard reuses the in-memory session for 30 minutes — restart the app "
-                "or paste a new token into .vss_token.txt if the session has expired."
+                "Paste a new token into .vss_token.json or restart the app."
             )
 
-        if login_max_wait_seconds is not None:
-            max_wait = max(30, int(login_max_wait_seconds))
-        else:
-            max_wait = int(float(_env("VSS_LOGIN_MAX_WAIT", "600") or "600"))
-            max_wait = max(120, max_wait)
-        token, pid = login_with_backoff(max_wait_seconds=max_wait)
+        if not _vss_credentials_in_env():
+            rec = _load_token_record()
+            if rec:
+                return _apply_token_record(rec, source="file")
+            raise RuntimeError("No VSS credentials in .env (VSS_USERNAME/VSS_PASSWORD).")
+
+        retry_login = allow_10082_retry or skip_file
+        token, pid = _login_and_persist(
+            login_max_wait_seconds=login_max_wait_seconds,
+            allow_10082_retry=retry_login,
+        )
         _LAST_TOKEN_SOURCE = "login"
-        _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = token, pid, datetime.now()
-        _save_token_to_file(token, pid)
+        now = datetime.now(timezone.utc)
+        _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = token, pid, now
         try:
-            _FILE_TOKEN_MTIME = _TOKEN_FILE.stat().st_mtime
+            _FILE_TOKEN_MTIME = _TOKEN_JSON_FILE.stat().st_mtime
         except OSError:
             _FILE_TOKEN_MTIME = None
         return token, pid
@@ -361,6 +721,26 @@ def _token_for_keepalive(*, allow_reauth: bool) -> tuple[str, str] | None:
     return ensure_token()
 
 
+def _token_api_status(token: str, path: str, payload: dict) -> int | None:
+    """POST to a VSS endpoint and return the JSON status code."""
+    payload = {**payload, "token": token}
+    try:
+        j = vss_post_raw(path, payload, timeout=20, max_attempts=2)
+        return j.get("status") if isinstance(j, dict) else None
+    except Exception:
+        return None
+
+
+def _token_is_live(token: str) -> bool:
+    """True when token works on a real data endpoint (not just lang dict)."""
+    st = _token_api_status(
+        token,
+        "/vss/fleet/findAll.action",
+        {"pageNum": -1, "pageCount": -1},
+    )
+    return st in (10000, 10025)
+
+
 def keepalive_ping(*, allow_reauth: bool = True) -> bool:
     """Touch a tiny endpoint to reset the VSS 30-min inactivity timer.
 
@@ -376,33 +756,26 @@ def keepalive_ping(*, allow_reauth: bool = True) -> bool:
     if not tok:
         return False
     token, _ = tok
-    payload = {"token": token, "terminal": 2, "lang": "en"}
-    j = vss_post_raw("/vss/lang/findLangDict.action", payload, timeout=15, max_attempts=2)
-    status = j.get("status") if isinstance(j, dict) else None
-    if status == 10000:
+    if _token_is_live(token):
         return True
+    status = _token_api_status(token, "/vss/lang/findLangDict.action", {"terminal": 2, "lang": "en"})
     if status == 10023:
         if _vss_no_login() or not allow_reauth:
             return False
         try:
-            token2, _ = ensure_token(force=True)
-            j2 = vss_post_raw(
-                "/vss/lang/findLangDict.action",
-                {"token": token2, "terminal": 2, "lang": "en"},
-                timeout=15,
-                max_attempts=2,
+            _vss_log.info("VSS stored token rejected (10023) — apiLogin via .env and saving .vss_token.json")
+            token2, _ = ensure_token(
+                force=True,
+                skip_file=True,
+                login_max_wait_seconds=120,
+                allow_10082_retry=True,
             )
-            st2 = j2.get("status") if isinstance(j2, dict) else None
-            if st2 == 10000:
-                return True
-            if st2 == 10023:
-                return False
-            # Unusual response after reload — treat as alive to avoid false negatives.
-            return True
+            return _token_is_live(token2)
         except RuntimeError:
             return False
-    # Other status codes mean the token still authenticated us, just data was empty
-    return True
+    # A language-dictionary success is not enough: some expired sessions still
+    # pass that endpoint while fleet/device endpoints return 10023.
+    return False
 
 
 def validate_or_renew_token(*, allow_reauth: bool = True) -> tuple[bool, str]:
@@ -424,7 +797,7 @@ def validate_or_renew_token(*, allow_reauth: bool = True) -> tuple[bool, str]:
 
 
 def _retry_on_session_expired(call_fn):
-    """Run ``call_fn(token)``; on 10023 reload from env/file once, then stop (no long apiLogin loops)."""
+    """Run ``call_fn(token)``; on 10023 reload file token, then apiLogin from .env."""
     token, _ = ensure_token()
     try:
         return call_fn(token)
@@ -439,21 +812,25 @@ def _retry_on_session_expired(call_fn):
             msg2 = str(e2)
             if "10023" not in msg2 and "session has expired" not in msg2.lower():
                 raise
-            if _vss_no_login():
-                raise RuntimeError(
-                    "VSS session expired (10023). Refresh reuses the in-memory token — "
-                    "paste a new token into .vss_token.txt and restart, or wait for the "
-                    "next startup login."
-                ) from e2
-            if _load_token_from_file():
-                raise RuntimeError(
-                    "VSS session expired (10023). Paste a new token from the VSS web UI into "
-                    ".vss_token.txt (token and pid on one line or two lines), save, and click "
-                    "Refresh data — apiLogin is not used while .vss_token.txt exists (avoids 10082 lockout)."
-                ) from e2
-            if not _vss_credentials_in_env():
-                raise
-            token, _ = ensure_token(force=True, skip_file=True, login_max_wait_seconds=90)
+            time.sleep(2.0)
+            try:
+                return call_fn(token)
+            except RuntimeError:
+                pass
+            if not _vss_credentials_in_env() or _login_cooldown_active():
+                err = (
+                    "VSS session expired (10023). Paste a fresh token+pid into .vss_token.json "
+                    "or wait for login rate-limit to clear."
+                )
+                _set_last_vss_error(err)
+                raise RuntimeError(err) from e2
+            _vss_log.info("VSS stored token rejected (10023) — apiLogin via .env profiles")
+            token, _ = ensure_token(
+                force=True,
+                skip_file=True,
+                login_max_wait_seconds=120,
+                allow_10082_retry=True,
+            )
             return call_fn(token)
 
 
@@ -515,13 +892,16 @@ def list_all_fleets(token: str) -> list[dict]:
                 return dl
 
     try:
-        url = f"{BASE_URL}/vss/fleet/findAll.action"
-        r = _session.post(
-            url,
-            data={"token": token, "pageNum": "-1", "pageCount": "-1"},
-            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
-            timeout=60,
-        )
+        base = active_base_url()
+        url = f"{base}/vss/fleet/findAll.action"
+        with _vss_api_lock:
+            r = _session.post(
+                url,
+                data={"token": token, "pageNum": "-1", "pageCount": "-1"},
+                headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+                timeout=60,
+                verify=_ssl_verify_for_url(base),
+            )
         r.raise_for_status()
         j = r.json()
         if isinstance(j, dict) and j.get("status") == 10000:
@@ -648,22 +1028,27 @@ def explicit_dhl_fleets_from_env(token: str) -> dict[str, str]:
     return out
 
 
+def _dhl_fleet_pairs(token: str, *, contains: str = "DHL") -> list[tuple[str, str]]:
+    """Fleet id/name pairs whose name contains ``contains`` (no session retry wrapper)."""
+    q = (contains or "").strip().upper()
+    out: list[tuple[str, str]] = []
+    for f in list_all_fleets(token):
+        if not isinstance(f, dict):
+            continue
+        fid, name = _fleet_fields(f)
+        if not fid:
+            continue
+        if q and q not in name.upper():
+            continue
+        out.append((fid, name))
+    return out
+
+
 def discover_dhl_fleets(*, contains: str = "DHL") -> list[tuple[str, str]]:
     """Return [(fleet_id, fleet_name)] for fleets whose name contains the keyword."""
-    q = (contains or "").strip().upper()
 
     def _call(token: str) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
-        for f in list_all_fleets(token):
-            if not isinstance(f, dict):
-                continue
-            fid, name = _fleet_fields(f)
-            if not fid:
-                continue
-            if q and q not in name.upper():
-                continue
-            out.append((fid, name))
-        return out
+        return _dhl_fleet_pairs(token, contains=contains)
 
     return _retry_on_session_expired(_call)
 
@@ -674,7 +1059,7 @@ def discover_dhl_devices(
     max_pages: int = 60,
     contains: str = "DHL",
     skip_fleet_discovery: bool = False,
-    fleet_fetch_workers: int = 6,
+    fleet_fetch_workers: int = 1,
 ) -> list[dict]:
     """All devices that belong to DHL fleets.
 
@@ -713,7 +1098,7 @@ def discover_dhl_devices(
                 "DHL_ALLOW_KEYWORD_DEVICE_FALLBACK=1 to opt in to keyword paging.",
             )
         else:
-            fleet_pairs = discover_dhl_fleets(contains=contains)
+            fleet_pairs = _dhl_fleet_pairs(token, contains=contains)
             fleet_id_to_name = {fid: name for fid, name in fleet_pairs if fid}
             if not fleet_id_to_name:
                 _vss_log.warning(
@@ -744,7 +1129,7 @@ def discover_dhl_devices(
 
         rows: list[dict] = []
         if fleet_id_to_name:
-            w = max(1, min(fleet_fetch_workers, 16))
+            w = max(1, min(fleet_fetch_workers, 1))
             with ThreadPoolExecutor(max_workers=w) as ex:
                 for batch in ex.map(_fetch_one, list(fleet_id_to_name.keys())):
                     rows.extend(batch)
@@ -803,7 +1188,11 @@ def discover_dhl_devices(
                         seen[did] = r
         return list(seen.values())
 
-    return _retry_on_session_expired(_call)
+    def _run() -> list[dict]:
+        return _retry_on_session_expired(_call)
+
+    with _discover_lock:
+        return _run()
 
 
 def current_gps_and_status(token: str, device_ids: list[str] | str) -> list[dict]:
@@ -832,7 +1221,7 @@ def realtime_status_for_devices(
     *,
     batch: int = 20,
     sleep_s: float = 0.0,
-    max_workers: int = 6,
+    max_workers: int = 1,
 ) -> list[dict]:
     """Pull realtime status for many devices, parallel batches, returning a flat list."""
     chunks = [device_ids[i : i + batch] for i in range(0, len(device_ids), batch)]
@@ -852,7 +1241,8 @@ def realtime_status_for_devices(
                 return []
 
         out: list[dict] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        workers = max(1, min(max_workers, 1))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             for rows in ex.map(_fetch, chunks):
                 out.extend(rows)
         if sleep_s:

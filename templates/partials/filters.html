@@ -1,0 +1,60 @@
+{% macro filter_panel(method='get') %}
+<form method="{{ method }}" class="filter-panel">
+  <div class="filter-fields">
+    {{ caller() }}
+  </div>
+</form>
+{% endmacro %}
+
+{% macro filter_select(name, label, options, selected='', multiple=False) %}
+<label class="filter-field">
+  <span class="filter-label">{{ label }}</span>
+  <select name="{{ name }}" class="filter-select"{% if multiple %} multiple{% endif %}>
+    {% for opt in options %}
+      {% if opt is mapping %}
+        {% set val = opt.value %}
+        {% set lbl = opt.label %}
+      {% else %}
+        {% set val = opt %}
+        {% set lbl = opt %}
+      {% endif %}
+      <option value="{{ val }}"{% if multiple and selected is sequence and val in selected %} selected{% elif not multiple and selected == val %} selected{% endif %}>{{ lbl }}</option>
+    {% endfor %}
+  </select>
+</label>
+{% endmacro %}
+
+{% macro filter_multi(name, label, options, selected) %}
+<div class="filter-field filter-multi" data-name="{{ name }}">
+  <span class="filter-label">{{ label }}</span>
+  <button type="button" class="filter-multi-toggle" aria-expanded="false">
+    <span class="filter-multi-summary">All</span>
+    <span class="filter-multi-caret" aria-hidden="true">▾</span>
+  </button>
+  <div class="filter-multi-menu" hidden>
+    {% if options %}
+      {% for opt in options %}
+        <label class="filter-multi-option">
+          <input type="checkbox" name="{{ name }}" value="{{ opt }}" {% if opt in selected %}checked{% endif %}>
+          {{ opt }}
+        </label>
+      {% endfor %}
+    {% else %}
+      <div class="filter-multi-empty">Options appear when VSS data loads</div>
+    {% endif %}
+  </div>
+</div>
+{% endmacro %}
+
+{% macro filter_number(name, label, value, min=1, max=72, step=0.5) %}
+<label class="filter-field">
+  <span class="filter-label">{{ label }}</span>
+  <input type="number" name="{{ name }}" class="filter-input" value="{{ value }}" min="{{ min }}" max="{{ max }}" step="{{ step }}">
+</label>
+{% endmacro %}
+
+{% macro filter_submit(label='Apply filters') %}
+<div class="filter-field filter-actions">
+  <button type="submit" class="btn-accent">{{ label }}</button>
+</div>
+{% endmacro %}

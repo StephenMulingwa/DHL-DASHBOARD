@@ -206,7 +206,9 @@ class _CacheEntry:
 
 _cache: dict[str, _CacheEntry] = {}
 _cache_lock = threading.Lock()
+_cache_producer_locks: dict[str, threading.Lock] = {}
 _mix_load_lock = threading.Lock()
+_mix_health_error: str | None = None
 # Monotonic time of last ``bust_cache(None)`` (manual / scheduled full refresh).
 _last_full_bust_at: float | None = None
 
@@ -217,10 +219,35 @@ def _cached(key: str, ttl: int, producer: Callable[[], Any]) -> Any:
         entry = _cache.get(key)
         if entry and now - entry.at < ttl:
             return entry.value
-    value = producer()
-    with _cache_lock:
-        _cache[key] = _CacheEntry(value=value)
-    return value
+        prod_lock = _cache_producer_locks.setdefault(key, threading.Lock())
+
+    # If a background refresh is already producing this value, keep serving the
+    # stale value rather than making page requests pile up behind the same VSS
+    # workflow. The producer will replace the cache when it finishes.
+    if not prod_lock.acquire(blocking=False):
+        if entry:
+            return entry.value
+        with prod_lock:
+            with _cache_lock:
+                entry = _cache.get(key)
+                if entry:
+                    return entry.value
+        value = producer()
+        with _cache_lock:
+            _cache[key] = _CacheEntry(value=value)
+        return value
+
+    try:
+        with _cache_lock:
+            entry = _cache.get(key)
+            if entry and time.time() - entry.at < ttl:
+                return entry.value
+        value = producer()
+        with _cache_lock:
+            _cache[key] = _CacheEntry(value=value)
+        return value
+    finally:
+        prod_lock.release()
 
 
 def bust_cache(prefix: str | None = None) -> None:
@@ -352,7 +379,7 @@ def _load_dhl_devices() -> pd.DataFrame:
                 "yes",
                 "on",
             )
-            workers = int(os.environ.get("DHL_FAST_DEVICE_FLEET_WORKERS", "6") or "6")
+            workers = int(os.environ.get("DHL_FAST_DEVICE_FLEET_WORKERS", "1") or "1")
             rows = discover_dhl_devices(
                 page_size=200,
                 max_pages=max_pages,
@@ -361,7 +388,7 @@ def _load_dhl_devices() -> pd.DataFrame:
                 fleet_fetch_workers=max(1, workers),
             )
         else:
-            workers = int(os.environ.get("DHL_DEVICE_FLEET_WORKERS", "10") or "10")
+            workers = int(os.environ.get("DHL_DEVICE_FLEET_WORKERS", "1") or "1")
             rows = discover_dhl_devices(
                 page_size=200,
                 max_pages=60,
@@ -650,16 +677,27 @@ def get_mix_asset_dropdown_options() -> list[dict]:
     return options
 
 
+def last_mix_error() -> str | None:
+    return _mix_health_error
+
+
 def _load_mix_health() -> pd.DataFrame:
+    global _mix_health_error
     from mix_health import build_health_dataframe, empty_health_dataframe
     from mix_client import mix_enabled
 
     if not mix_enabled():
+        _mix_health_error = None
         return empty_health_dataframe()
     with _mix_load_lock:
-        df = build_health_dataframe()
-        cache_put("mix_health", df)
-        return df
+        try:
+            df = build_health_dataframe()
+            _mix_health_error = None
+            cache_put("mix_health", df)
+            return df
+        except Exception as exc:
+            _mix_health_error = str(exc)
+            raise
 
 
 def load_mix_health() -> pd.DataFrame:
@@ -838,9 +876,9 @@ def _realtime_fetch_params() -> tuple[int, float, int]:
         # Larger batches = fewer HTTP round-trips to VSS (faster fleet realtime pull).
         batch = 24 if fast_mode() else 16
     if max_workers <= 0:
-        max_workers = 12
+        max_workers = 1
     batch = max(3, min(batch, 50))
-    max_workers = max(2, min(max_workers, 14))
+    max_workers = max(1, min(max_workers, 1))
     return batch, max(0.0, sleep_s), max_workers
 
 
@@ -942,28 +980,38 @@ def _normalize_realtime_row(raw: dict, baseline_by_id: dict[str, dict]) -> dict:
     }
 
 
+def _realtime_baseline_from_devices(devices_df: pd.DataFrame) -> pd.DataFrame:
+    """Device list with unknown live fields when VSS realtime is unavailable."""
+    base = devices_df[["DeviceID", "DeviceName", "FleetID", "Fleet"]].copy()
+    merged = base.copy()
+    empty_extra = ["VideoLostChannels"] + [f"VideoLost_Ch{n}" for n in range(1, RT_VIDEO_LOST_CHANNEL_MAX + 1)]
+    for col in [
+        "Time", "AgeHours", "Ignition", "MobileNetwork", "GPSModule", "GsensorModule",
+        "WifiModule", "NotRecordingFlag", *empty_extra, "recordstateFormatter", "videoloststateFormatter",
+        "videomaskstateFormatter", "netType", "signalValue", "cpuTemp", "diskTemp",
+        "devVoltage", "batVoltage", "StatusType",
+    ]:
+        merged[col] = pd.Series(dtype="object")
+    merged["StatusType"] = "Status Unknown"
+    return merged
+
+
 def _load_realtime_status() -> pd.DataFrame:
     devices_df = load_dhl_devices()
     if devices_df.empty:
-        # Same schema as a normal merge so callbacks (e.g. device drilldown) never see a bare empty frame.
-        base = pd.DataFrame(columns=["DeviceID", "DeviceName", "FleetID", "Fleet"])
-        merged = base.copy()
-        empty_extra = ["VideoLostChannels"] + [f"VideoLost_Ch{n}" for n in range(1, RT_VIDEO_LOST_CHANNEL_MAX + 1)]
-        for col in [
-            "Time", "AgeHours", "Ignition", "MobileNetwork", "GPSModule", "GsensorModule",
-            "WifiModule", "NotRecordingFlag", *empty_extra, "recordstateFormatter", "videoloststateFormatter",
-            "videomaskstateFormatter", "netType", "signalValue", "cpuTemp", "diskTemp",
-            "devVoltage", "batVoltage", "StatusType",
-        ]:
-            merged[col] = pd.Series(dtype="object")
-        merged["StatusType"] = "Status Unknown"
-        return merged
+        return _realtime_baseline_from_devices(
+            pd.DataFrame(columns=["DeviceID", "DeviceName", "FleetID", "Fleet"])
+        )
 
     baseline_by_id = _baseline_by_device_id(devices_df)
     device_ids = sorted({str(r["DeviceID"]).strip() for r in baseline_by_id.values() if str(r.get("DeviceID", "")).strip()})
 
     rb, rs, rw = _realtime_fetch_params()
-    rows = realtime_status_for_devices(device_ids, batch=rb, sleep_s=rs, max_workers=rw)
+    try:
+        rows = realtime_status_for_devices(device_ids, batch=rb, sleep_s=rs, max_workers=rw)
+    except Exception as e:
+        log.warning("realtime VSS fetch failed — using device baseline: %s", e)
+        return _realtime_baseline_from_devices(devices_df)
     if not rows:
         rows = []
 
@@ -972,17 +1020,7 @@ def _load_realtime_status() -> pd.DataFrame:
 
     base = devices_df[["DeviceID", "DeviceName", "FleetID", "Fleet"]].copy()
     if rt_df.empty:
-        merged = base.copy()
-        empty_extra = ["VideoLostChannels"] + [f"VideoLost_Ch{n}" for n in range(1, RT_VIDEO_LOST_CHANNEL_MAX + 1)]
-        for col in [
-            "Time", "AgeHours", "Ignition", "MobileNetwork", "GPSModule", "GsensorModule",
-            "WifiModule", "NotRecordingFlag", *empty_extra, "recordstateFormatter", "videoloststateFormatter",
-            "videomaskstateFormatter", "netType", "signalValue", "cpuTemp", "diskTemp",
-            "devVoltage", "batVoltage", "StatusType",
-        ]:
-            merged[col] = pd.Series(dtype="object")
-        merged["StatusType"] = "Status Unknown"
-        return merged
+        return _realtime_baseline_from_devices(devices_df)
 
     rt_df = rt_df.drop(columns=["DeviceName", "FleetID", "Fleet"], errors="ignore")
     merged = base.merge(rt_df, on="DeviceID", how="left")
@@ -1084,16 +1122,23 @@ def _load_alarms_last_hours(hours: int) -> pd.DataFrame:
         max_pages = max(3, int(os.environ.get("DHL_FAST_ALARM_MAX_PAGES", "10") or "10"))
 
     # NOTE: this server ignores fleetIdList on /alarm/findAllByTime — query by deviceID batches.
-    rows = alarms_find_all_by_time_for_devices(
-        begin_dt=begin_dt,
-        end_dt=end_dt,
-        device_ids=device_ids,
-        alarm_type_csv=alarm_type_csv,
-        page_count=500,
-        max_pages=max_pages,
-        batch_size=50,
-        max_workers=max_workers,
-    )
+    try:
+        rows = alarms_find_all_by_time_for_devices(
+            begin_dt=begin_dt,
+            end_dt=end_dt,
+            device_ids=device_ids,
+            alarm_type_csv=alarm_type_csv,
+            page_count=500,
+            max_pages=max_pages,
+            batch_size=50,
+            max_workers=max_workers,
+        )
+    except Exception as e:
+        log.warning("alarms VSS fetch failed — returning empty set: %s", e)
+        return pd.DataFrame(columns=[
+            "DeviceID", "DeviceName", "Fleet", "AlarmCode", "AlarmName",
+            "AlarmTime", "Lat", "Lon", "Speed", "PlateNo",
+        ])
 
     if not rows:
         return pd.DataFrame(columns=[

@@ -1,7 +1,7 @@
 """MiX Telematics API client (positions + asset metadata).
 
-Credentials: ``accounts.json`` in the repo (see ``accounts.json.example``) or
-inline ``MIX_*`` env vars. Enable with ``MIX_ENABLED=1``.
+Credentials: ``MIX_ACCOUNTS_JSON`` env var (preferred), ``accounts.json`` file
+(see ``accounts.json.example``), or inline ``MIX_*`` env vars. Enable with ``MIX_ENABLED=1``.
 
 South Africa (``mix_za``) is the default server key. Set ``MIX_GROUP_IDS`` for
 explicit groups, ``MIX_GROUP_NAME_CONTAINS`` to match organisation names, or
@@ -95,10 +95,38 @@ def _inline_creds_complete() -> bool:
     return all(_env(k) for k in keys)
 
 
+def _load_accounts_blob() -> dict[str, Any]:
+    """Load MiX credentials from MIX_ACCOUNTS_JSON env, file path, or inline MIX_* vars."""
+    raw_json = _env("MIX_ACCOUNTS_JSON")
+    if raw_json:
+        try:
+            blob = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"MIX_ACCOUNTS_JSON is not valid JSON: {exc}") from exc
+        if not isinstance(blob, dict):
+            raise ValueError("MIX_ACCOUNTS_JSON must be a JSON object keyed by server name")
+        return blob
+
+    path = _resolve_accounts_path()
+    if path.is_file():
+        with path.open(encoding="utf-8") as fh:
+            blob = json.load(fh)
+        if not isinstance(blob, dict):
+            raise ValueError(f"{path} must contain a JSON object keyed by server name")
+        return blob
+
+    raise FileNotFoundError(
+        f"MiX credentials not found. Set MIX_ACCOUNTS_JSON in .env, "
+        f"copy accounts.json.example to {path.name}, or set MIX_* env vars."
+    )
+
+
 def mix_enabled() -> bool:
     if _env_truthy("MIX_DISABLED"):
         return False
     if _env_truthy("MIX_ENABLED"):
+        return True
+    if _env("MIX_ACCOUNTS_JSON"):
         return True
     path = _resolve_accounts_path()
     return path.is_file() or _inline_creds_complete()
@@ -109,6 +137,8 @@ def mix_config_summary() -> str:
         return "disabled"
     if _inline_creds_complete():
         return f"inline env ({_env('MIX_API_URL')})"
+    if _env("MIX_ACCOUNTS_JSON"):
+        return f"MIX_ACCOUNTS_JSON [{_server_key()}]"
     path = _resolve_accounts_path()
     return f"{path.name} [{_server_key()}]"
 
@@ -124,17 +154,12 @@ def _load_server_creds() -> dict[str, str]:
             "IdentityPassword": _env("MIX_PASSWORD"),
             "IdentityScope": _env("MIX_SCOPE", "openid profile offline_access"),
         }
-    path = _resolve_accounts_path()
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"MiX accounts file not found: {path}. "
-            "Copy accounts.json.example to accounts.json or set MIX_* env vars."
-        )
     server_key = _server_key()
-    with path.open(encoding="utf-8") as fh:
-        all_creds = json.load(fh)
+    all_creds = _load_accounts_blob()
     if server_key not in all_creds:
-        raise KeyError(f"Key '{server_key}' not in {path}. Available: {list(all_creds.keys())}")
+        raise KeyError(
+            f"Key '{server_key}' not in MiX accounts. Available: {list(all_creds.keys())}"
+        )
     return all_creds[server_key]
 
 
@@ -152,6 +177,8 @@ def ensure_bearer_token() -> str:
     creds = _load_server_creds()
     token_url = f"{creds['IdentityUrl'].rstrip('/')}/core/connect/token"
     scope = creds.get("IdentityScope", "").replace("+", " ")
+    if not scope:
+        scope = "openid profile offline_access MiX.Integrate"
     payload = {
         "grant_type": "password",
         "client_id": creds["IdentityClientId"],
@@ -160,10 +187,15 @@ def ensure_bearer_token() -> str:
         "password": creds["IdentityPassword"],
         "scope": scope,
     }
-    log.info("MiX: requesting bearer token from %s", token_url)
-    resp = _session.post(token_url, data=payload, timeout=30)
+    headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
+    log.info("MiX: requesting bearer token from %s (user=%s)", token_url, creds["IdentityUsername"])
+    resp = _session.post(token_url, data=payload, headers=headers, timeout=30)
     if resp.status_code != 200:
-        raise RuntimeError(f"MiX token request failed ({resp.status_code}): {resp.text[:300]}")
+        detail = _mix_token_error_detail(resp)
+        raise RuntimeError(
+            f"MiX token request failed ({resp.status_code}): {detail}. "
+            f"Check IdentityUsername/IdentityPassword in MIX_ACCOUNTS_JSON for {_server_key()}."
+        )
     data = resp.json()
     token = str(data["access_token"])
     expires_in = int(data.get("expires_in", 3600))
@@ -172,6 +204,21 @@ def ensure_bearer_token() -> str:
         _token_expires_at = time.time() + expires_in
     log.info("MiX: token acquired (valid ~%s min)", expires_in // 60)
     return token
+
+
+def _mix_token_error_detail(resp: requests.Response) -> str:
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            parts = [str(body.get(k)) for k in ("error", "error_description", "message") if body.get(k)]
+            if parts:
+                return " — ".join(parts)
+    except Exception:
+        pass
+    text = (resp.text or "").strip()
+    if text.startswith("<!DOCTYPE") or text.startswith("<html"):
+        return "Unauthorized (invalid MiX username, password, or client credentials)"
+    return text[:200]
 
 
 def _api_headers(token: str) -> dict[str, str]:
@@ -195,7 +242,7 @@ def fetch_organisation_groups(*, force_refresh: bool = False) -> list[dict[str, 
     token = ensure_bearer_token()
     api = api_base_url()
     url = f"{api}/api/organisationgroups"
-    resp = _session.get(url, headers=_api_headers(token), timeout=30)
+    resp = _mix_http("get", url, headers=_api_headers(token), timeout=30)
     if resp.status_code != 200:
         raise RuntimeError(f"MiX organisation groups failed ({resp.status_code}): {resp.text[:300]}")
     data = resp.json()
@@ -276,9 +323,9 @@ def _safe_get(record: dict, *keys: str, default: str = "") -> str:
 def _throttle_mix_api() -> None:
     """MiX ZA allows ~20 API calls/min — stay under that when scanning many groups."""
     try:
-        max_per_min = int(_env("MIX_MAX_CALLS_PER_MINUTE", "18") or "18")
+        max_per_min = int(_env("MIX_MAX_CALLS_PER_MINUTE", "15") or "15")
     except ValueError:
-        max_per_min = 18
+        max_per_min = 15
     max_per_min = max(5, min(max_per_min, 19))
     with _rate_lock:
         now = time.time()
@@ -289,6 +336,37 @@ def _throttle_mix_api() -> None:
             if wait > 0:
                 time.sleep(wait)
         _rate_times.append(time.time())
+
+
+def _mix_http(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: int = 90,
+    **kwargs: Any,
+) -> requests.Response:
+    """MiX API call with client-side throttle and 429 backoff."""
+    last: requests.Response | None = None
+    for attempt in range(4):
+        _throttle_mix_api()
+        resp = getattr(_session, method.lower())(url, headers=headers, timeout=timeout, **kwargs)
+        if resp.status_code != 429:
+            return resp
+        last = resp
+        with _rate_lock:
+            oldest = _rate_times[0] if _rate_times else time.time()
+        wait = max(5.0, 61.0 - (time.time() - oldest))
+        log.warning(
+            "MiX rate limited (429) on %s; retry in %.0fs (attempt %s/4)",
+            url.split("/api/", 1)[-1][:60],
+            wait,
+            attempt + 1,
+        )
+        time.sleep(wait)
+    if last is None:
+        raise RuntimeError("MiX request failed before any response")
+    return last
 
 
 def _post_positions_for_groups(
@@ -305,8 +383,8 @@ def _post_positions_for_groups(
     if cached_since:
         params["cachedSince"] = cached_since
     params["ensureReverseGeocoded"] = str(ensure_reverse_geocoded).lower()
-    _throttle_mix_api()
-    resp = _session.post(
+    resp = _mix_http(
+        "post",
         url,
         headers=_api_headers(token),
         params=params,

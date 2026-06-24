@@ -1,0 +1,17 @@
+{% from 'partials/nav_icons.html' import nav_icon %}
+<aside class="sidebar" id="app-sidebar">
+  <nav class="sidebar-nav" aria-label="Main navigation">
+    {% for item in nav_items %}
+      <a href="{{ item.href }}" class="nav-item{% if item.active %} active{% endif %}" title="{{ item.label }}">
+        <span class="nav-icon">{{ nav_icon(item.icon) }}</span>
+        <span class="nav-label">{{ item.label }}</span>
+      </a>
+    {% endfor %}
+  </nav>
+  <div class="sidebar-footer">
+    <a class="sidebar-powered" href="https://www.controltech-ea.com/" target="_blank" rel="noopener" title="Powered by ControlTech">
+      <span class="sidebar-powered-text">Powered by ControlTech</span>
+      <img src="{{ url_for('static', filename='controltech_logo.png') }}" alt="ControlTech">
+    </a>
+  </div>
+</aside>

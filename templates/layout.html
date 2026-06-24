@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ title }} · DHL Fleet Health{% endblock %}</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='dhl_logo.png') }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='flask-theme.css') }}">
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <script src="{{ url_for('static', filename='filters.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='tables.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='sidebar.js') }}" defer></script>
+  {% block head_extra %}{% endblock %}
+</head>
+<body{% if awaiting_vss %} data-awaiting-realtime="1"{% endif %}>
+  {% include 'partials/topbar.html' %}
+  {% include 'partials/sidebar_mobile.html' %}
+
+  <div class="app-layout">
+    {% include 'partials/sidebar.html' %}
+    <main class="main-content">
+      {% if vss_error %}
+        <div class="banner banner-warn" role="alert">
+          <strong>VSS connection issue:</strong> {{ vss_error }}
+        </div>
+      {% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+
+  <script>
+    function updateClock() {
+      const el = document.getElementById('topbar-clock');
+      if (!el) return;
+      const now = new Date();
+      el.textContent = now.toLocaleString(undefined, {
+        weekday: 'short', year: 'numeric', month: 'short',
+        day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit'
+      });
+    }
+    updateClock();
+    setInterval(updateClock, 1000);
+
+    async function refreshCacheStatus() {
+      try {
+        const r = await fetch('/api/cache/status');
+        if (!r.ok) return;
+        const data = await r.json();
+        const el = document.getElementById('cache-status');
+        if (el && data.latest_data) {
+          el.textContent = 'Data updated ' + data.latest_data;
+        }
+        if (data.freshness && data.freshness.realtime_status && data.freshness.realtime_status !== 'not loaded' && window.__dhlAwaitingRealtime) {
+          window.location.reload();
+        }
+      } catch (_) {}
+    }
+    window.__dhlAwaitingRealtime = document.body.dataset.awaitingRealtime === '1';
+    refreshCacheStatus();
+    setInterval(refreshCacheStatus, {{ ui_poll_ms }});
+
+    document.getElementById('btn-refresh')?.addEventListener('click', async function () {
+      const btn = this;
+      btn.disabled = true;
+      btn.textContent = 'Refreshing…';
+      try {
+        await fetch('/api/refresh', { method: 'POST' });
+        setTimeout(() => window.location.reload(), 1500);
+      } catch (_) {
+        btn.disabled = false;
+        btn.textContent = 'Refresh data';
+      }
+    });
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,5 +1,6 @@
 .env
 .vss_token.txt
+.vss_token.json
 accounts.json
 .dhl_devices_snapshot.csv
 .venv/

@@ -1,0 +1,39 @@
+{% extends 'layout.html' %}
+{% from 'partials/macros.html' import kpi_row, page_header %}
+{% from 'partials/filters.html' import filter_panel, filter_multi, filter_select, filter_number, filter_submit %}
+
+{% block content %}
+{{ page_header(title, subtitle) }}
+
+{% call filter_panel() %}
+  {{ filter_multi('fleet', 'Fleet', fleet_opts, fleets) }}
+  {{ filter_multi('status', 'Status', status_opts, statuses) }}
+  {{ filter_multi('ignition', 'Ignition', ignition_opts, ignitions) }}
+  {{ filter_select('ch_filter', 'Video lost channel', [
+    {'value': 'all', 'label': 'All'},
+    {'value': '1', 'label': 'CH1 only'},
+    {'value': '2', 'label': 'CH2 only'},
+    {'value': '3', 'label': 'CH3 only'},
+    {'value': '4', 'label': 'CH4 only'},
+  ], ch_filter) }}
+  {{ filter_select('chart', 'Chart', [
+    {'value': 'online_pie', 'label': 'Online vs Offline'},
+    {'value': 'status_donut', 'label': 'Status breakdown'},
+    {'value': 'modules', 'label': 'Module health'},
+    {'value': 'channels', 'label': 'Camera channels'},
+    {'value': 'age_hist', 'label': 'Status age'},
+    {'value': 'signal_box', 'label': 'Mobile signal'},
+  ], chart) }}
+  {{ filter_number('age_hours', 'Age threshold (h)', age_hours) }}
+  {{ filter_submit() }}
+{% endcall %}
+
+{{ kpi_row(kpis) }}
+
+<div class="chart-card full">{{ chart_html|safe }}</div>
+
+<div class="table-card">
+  <h3 class="table-title">Device-level table</h3>
+  {{ table_html|safe }}
+</div>
+{% endblock %}

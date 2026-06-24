@@ -1,0 +1,21 @@
+{% extends 'layout.html' %}
+{% from 'partials/macros.html' import kpi_row, page_header, render_banners %}
+{% from 'partials/filters.html' import filter_panel, filter_number, filter_submit %}
+
+{% block content %}
+{{ page_header(title, subtitle) }}
+{{ render_banners(banners) }}
+
+{% call filter_panel() %}
+  {{ filter_number('age_hours', 'Age threshold (hours)', age_hours) }}
+  {{ filter_submit('Apply') }}
+{% endcall %}
+
+{{ kpi_row(kpis) }}
+
+<div class="chart-grid overview-charts">
+  {% for chart in charts %}
+    <div class="chart-card">{{ chart|safe }}</div>
+  {% endfor %}
+</div>
+{% endblock %}

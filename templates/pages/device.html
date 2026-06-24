@@ -1,0 +1,43 @@
+{% extends 'layout.html' %}
+{% from 'partials/macros.html' import kpi_row, page_header %}
+
+{% block content %}
+{{ page_header(title, subtitle) }}
+
+<form method="get" class="filter-row">
+  <label>Vehicle
+    <select name="device_id" onchange="this.form.submit()">
+      <option value="">— Select a device —</option>
+      {% for opt in device_options %}
+        <option value="{{ opt.id }}" {% if device_id == opt.id %}selected{% endif %}>{{ opt.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+</form>
+
+{% if device_id %}
+  {{ kpi_row(kpis) }}
+
+  {% if faults %}
+    <div class="faults-card">
+      <h3 class="table-title">Current faults &amp; flags</h3>
+      <div class="fault-pills">
+        {% for f in faults %}
+          <span class="fault-pill {% if f.ok %}ok{% else %}bad{% endif %}">{{ f.label }}</span>
+        {% endfor %}
+      </div>
+    </div>
+  {% endif %}
+
+  {% if kpis or faults %}
+  <div class="chart-card full">{{ chart_html|safe }}</div>
+  {% endif %}
+
+  <div class="table-card">
+    <h3 class="table-title">Alarm history (24h)</h3>
+    {{ table_html|safe }}
+  </div>
+{% else %}
+  <div class="banner banner-info">Select a vehicle above to view its drilldown.</div>
+{% endif %}
+{% endblock %}

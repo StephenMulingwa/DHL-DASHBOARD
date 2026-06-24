@@ -1,0 +1,31 @@
+{% extends 'layout.html' %}
+{% from 'partials/macros.html' import kpi_row, page_header %}
+{% from 'partials/filters.html' import filter_panel, filter_multi, filter_submit %}
+
+{% block content %}
+{{ page_header(title, subtitle) }}
+
+{% if not enabled %}
+  <div class="banner banner-warn">{{ notice }}</div>
+{% else %}
+  {% if notice %}
+    <div class="banner banner-warn" role="alert"><strong>MiX connection issue:</strong> {{ notice }}</div>
+  {% endif %}
+
+  {% call filter_panel() %}
+    {{ filter_multi('issue', 'Issue type', issue_opts, issues) }}
+    {{ filter_submit() }}
+  {% endcall %}
+
+  {{ kpi_row(kpis) }}
+
+  {% if chart_html %}
+    <div class="chart-card full">{{ chart_html|safe }}</div>
+  {% endif %}
+
+  <div class="table-card">
+    <h3 class="table-title">Flagged assets</h3>
+    {{ table_html|safe }}
+  </div>
+{% endif %}
+{% endblock %}
