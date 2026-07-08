@@ -1,0 +1,290 @@
+{% extends 'layout.html' %}
+{% from 'partials/macros.html' import page_header %}
+
+{% block content %}
+{{ page_header(title, subtitle) }}
+
+<div class="logs-panel">
+  <div class="logs-toolbar">
+    <span class="logs-status" id="logs-status">Live</span>
+    <button type="button" class="btn btn-primary btn-sm" id="logs-refresh-btn">Reload sessions</button>
+  </div>
+  <div class="logs-table-wrap" aria-live="polite">
+    {% if sessions %}
+    <table class="data-table logs-sessions-table">
+      <thead>
+        <tr>
+          <th class="log-col-toggle" aria-label="Expand"></th>
+          <th>Type</th>
+          <th>Started</th>
+          <th>User</th>
+          <th>Steps</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="logs-sessions-body">
+        {% for sess in sessions %}
+        {% set is_open = sess.status == 'running' or loop.index0 == 0 %}
+        <tr class="log-session-row log-session-{{ sess.status }}" data-session-id="{{ sess.id }}" role="button" tabindex="0" aria-expanded="{{ 'true' if is_open else 'false' }}">
+          <td class="log-col-toggle"><span class="log-session-chevron" aria-hidden="true">▾</span></td>
+          <td><span class="log-session-badge log-session-badge-{{ sess.trigger }}">{{ sess.title }}</span></td>
+          <td class="log-session-time">{{ sess.started_display }}</td>
+          <td class="log-session-user">{{ sess.username or '—' }}</td>
+          <td class="log-session-count">{{ sess.events|length }}</td>
+          <td><span class="log-session-status log-session-status-{{ sess.status }}">{{ sess.status }}</span></td>
+        </tr>
+        <tr class="log-session-detail" data-detail-for="{{ sess.id }}"{% if not is_open %} hidden{% endif %}>
+          <td colspan="6">
+            <div class="log-detail-wrap">
+              <table class="data-table log-events-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Category</th>
+                    <th>Step</th>
+                    <th>Status</th>
+                    <th>Message</th>
+                  </tr>
+                </thead>
+                <tbody class="log-events-body">
+                  {% if sess.events %}
+                  {% for ev in sess.events %}
+                  <tr class="log-event-row log-{{ ev.status }}" data-id="{{ ev.id }}">
+                    <td class="log-ts" data-iso="{{ ev.ts }}"></td>
+                    <td><span class="log-badge log-cat-{{ ev.category }}">{{ ev.category }}</span></td>
+                    <td class="log-step">{{ ev.step }}</td>
+                    <td><span class="log-status log-status-{{ ev.status }}">{{ ev.status }}</span></td>
+                    <td class="log-msg">{{ ev.message }}</td>
+                  </tr>
+                  {% endfor %}
+                  {% else %}
+                  <tr class="log-event-empty">
+                    <td colspan="5">No steps recorded for this session.</td>
+                  </tr>
+                  {% endif %}
+                </tbody>
+              </table>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="logs-empty" id="logs-empty">No sessions yet. Sign in or click Refresh data to start a pipeline run.</p>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+(function () {
+  let latestId = {{ latest_id | default(0) }};
+  const wrap = document.querySelector('.logs-table-wrap');
+  const statusEl = document.getElementById('logs-status');
+  const pollMs = 3000;
+
+  function sessionsBody() {
+    return document.getElementById('logs-sessions-body');
+  }
+
+  function formatTs(iso) {
+    if (!iso) return '';
+    try {
+      return new Date(iso).toLocaleString(undefined, { hour12: false });
+    } catch (e) {
+      return iso;
+    }
+  }
+
+  function formatTimestamps(root) {
+    (root || document).querySelectorAll('.log-ts[data-iso]').forEach(function (el) {
+      if (!el.textContent) el.textContent = formatTs(el.getAttribute('data-iso'));
+    });
+  }
+
+  function eventRowHtml(ev) {
+    return '<tr class="log-event-row log-' + (ev.status || 'ok') + '" data-id="' + ev.id + '">' +
+      '<td class="log-ts">' + formatTs(ev.ts) + '</td>' +
+      '<td><span class="log-badge log-cat-' + ev.category + '">' + ev.category + '</span></td>' +
+      '<td class="log-step">' + (ev.step || '') + '</td>' +
+      '<td><span class="log-status log-status-' + (ev.status || 'ok') + '">' + (ev.status || 'ok') + '</span></td>' +
+      '<td class="log-msg">' + (ev.message || '') + '</td></tr>';
+  }
+
+  function eventsTableHtml(events) {
+    var rows = (events || []).map(eventRowHtml).join('');
+    if (!rows) {
+      rows = '<tr class="log-event-empty"><td colspan="5">No steps recorded for this session.</td></tr>';
+    }
+    return '<div class="log-detail-wrap">' +
+      '<table class="data-table log-events-table">' +
+        '<thead><tr><th>Time</th><th>Category</th><th>Step</th><th>Status</th><th>Message</th></tr></thead>' +
+        '<tbody class="log-events-body">' + rows + '</tbody>' +
+      '</table></div>';
+  }
+
+  function setDetailOpen(summaryRow, detailRow, open) {
+    if (!summaryRow || !detailRow) return;
+    detailRow.hidden = !open;
+    summaryRow.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+
+  function toggleSessionRow(summaryRow) {
+    var detail = findDetailRow(summaryRow.dataset.sessionId);
+    if (!detail) return;
+    setDetailOpen(summaryRow, detail, detail.hidden);
+  }
+
+  function renderSessionRows(sess, open) {
+    var isOpen = open !== false;
+    var events = sess.events || [];
+    var frag = document.createDocumentFragment();
+    var summary = document.createElement('tr');
+    summary.className = 'log-session-row log-session-' + (sess.status || 'running');
+    summary.dataset.sessionId = sess.id;
+    summary.setAttribute('role', 'button');
+    summary.tabIndex = 0;
+    summary.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+    summary.innerHTML =
+      '<td class="log-col-toggle"><span class="log-session-chevron" aria-hidden="true">▾</span></td>' +
+      '<td><span class="log-session-badge log-session-badge-' + sess.trigger + '">' + (sess.title || sess.trigger) + '</span></td>' +
+      '<td class="log-session-time">' + (sess.started_display || '') + '</td>' +
+      '<td class="log-session-user">' + (sess.username || '—') + '</td>' +
+      '<td class="log-session-count">' + events.length + '</td>' +
+      '<td><span class="log-session-status log-session-status-' + sess.status + '">' + sess.status + '</span></td>';
+
+    var detail = document.createElement('tr');
+    detail.className = 'log-session-detail';
+    detail.dataset.detailFor = sess.id;
+    detail.hidden = !isOpen;
+    detail.innerHTML = '<td colspan="6">' + eventsTableHtml(events) + '</td>';
+
+    frag.appendChild(summary);
+    frag.appendChild(detail);
+    return frag;
+  }
+
+  function findSummaryRow(sessionId) {
+    var tbody = sessionsBody();
+    return tbody && tbody.querySelector('.log-session-row[data-session-id="' + sessionId + '"]');
+  }
+
+  function findDetailRow(sessionId) {
+    var tbody = sessionsBody();
+    return tbody && tbody.querySelector('.log-session-detail[data-detail-for="' + sessionId + '"]');
+  }
+
+  function upsertSessions(sessions) {
+    var tbody = sessionsBody();
+    if (!sessions || !sessions.length || !tbody) return;
+    var empty = document.getElementById('logs-empty');
+    if (empty) empty.remove();
+
+    sessions.slice().reverse().forEach(function (sess) {
+      var summary = findSummaryRow(sess.id);
+      if (summary) {
+        var detail = findDetailRow(sess.id);
+        var body = detail && detail.querySelector('.log-events-body');
+        if (body) {
+          var seen = new Set(Array.from(body.querySelectorAll('[data-id]')).map(function (el) {
+            return parseInt(el.dataset.id, 10);
+          }));
+          (sess.events || []).forEach(function (ev) {
+            if (seen.has(ev.id)) return;
+            seen.add(ev.id);
+            latestId = Math.max(latestId, ev.id);
+            var emptyRow = body.querySelector('.log-event-empty');
+            if (emptyRow) emptyRow.remove();
+            body.insertAdjacentHTML('beforeend', eventRowHtml(ev));
+          });
+        }
+        var countEl = summary.querySelector('.log-session-count');
+        if (countEl) countEl.textContent = String((sess.events || []).length);
+        var st = summary.querySelector('.log-session-status');
+        if (st) {
+          st.textContent = sess.status;
+          st.className = 'log-session-status log-session-status-' + sess.status;
+        }
+        summary.className = 'log-session-row log-session-' + sess.status;
+      } else {
+        tbody.insertBefore(renderSessionRows(sess, sess.status === 'running'), tbody.firstChild);
+        (sess.events || []).forEach(function (ev) {
+          latestId = Math.max(latestId, ev.id || 0);
+        });
+      }
+    });
+  }
+
+  function replaceAllSessions(sessions) {
+    if (!wrap) return;
+    if (!sessions || !sessions.length) {
+      wrap.innerHTML = '<p class="logs-empty" id="logs-empty">No sessions yet. Sign in or click Refresh data to start a pipeline run.</p>';
+      return;
+    }
+    wrap.innerHTML =
+      '<table class="data-table logs-sessions-table">' +
+        '<thead><tr>' +
+          '<th class="log-col-toggle" aria-label="Expand"></th>' +
+          '<th>Type</th><th>Started</th><th>User</th><th>Steps</th><th>Status</th>' +
+        '</tr></thead><tbody id="logs-sessions-body"></tbody></table>';
+    var newBody = document.getElementById('logs-sessions-body');
+    sessions.forEach(function (sess, idx) {
+      var open = sess.status === 'running' || idx === 0;
+      newBody.appendChild(renderSessionRows(sess, open));
+      (sess.events || []).forEach(function (ev) {
+        latestId = Math.max(latestId, ev.id || 0);
+      });
+    });
+  }
+
+  async function pollLogs() {
+    try {
+      var r = await fetch('/api/logs?since=' + latestId + '&limit=50');
+      if (!r.ok) return;
+      var data = await r.json();
+      if (data.latest_id) latestId = Math.max(latestId, data.latest_id);
+      if (data.sessions) upsertSessions(data.sessions);
+      statusEl.textContent = 'Live · updated ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      statusEl.textContent = 'Poll error';
+    }
+  }
+
+  async function reloadSessions() {
+    statusEl.textContent = 'Reloading…';
+    try {
+      var r = await fetch('/api/logs/sessions');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      var data = await r.json();
+      replaceAllSessions(data.sessions || []);
+      formatTimestamps(wrap);
+      var lr = await fetch('/api/logs?since=0&limit=1');
+      if (lr.ok) {
+        var ld = await lr.json();
+        if (ld.latest_id) latestId = Math.max(latestId, ld.latest_id);
+      }
+      statusEl.textContent = 'Reloaded · ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      statusEl.textContent = 'Reload failed';
+    }
+  }
+
+  if (wrap) {
+    wrap.addEventListener('click', function (e) {
+      var row = e.target.closest('.log-session-row');
+      if (!row || !wrap.contains(row)) return;
+      toggleSessionRow(row);
+    });
+    wrap.addEventListener('keydown', function (e) {
+      var row = e.target.closest('.log-session-row');
+      if (!row || (e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      toggleSessionRow(row);
+    });
+  }
+  formatTimestamps(wrap);
+  document.getElementById('logs-refresh-btn').addEventListener('click', reloadSessions);
+  setInterval(pollLogs, pollMs);
+})();
+</script>
+{% endblock %}

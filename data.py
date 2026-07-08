@@ -19,6 +19,8 @@ from typing import Any, Callable
 
 import pandas as pd
 
+import neon_snapshot_store
+
 from vss_client import (
     alarms_find_all_by_time_for_devices,
     discover_dhl_devices,
@@ -43,6 +45,7 @@ _MIX_CATALOG_PATH = Path(__file__).resolve().parent / ".mix_asset_catalog.csv"
 log = logging.getLogger(__name__)
 _REPO_DIR = Path(__file__).resolve().parent
 _DEVICE_SNAPSHOT_COLUMNS = ["DeviceID", "DeviceName", "FleetID", "Fleet"]
+_NEON_SNAPSHOT_KEYS = {"dhl_devices", "realtime_status", "alarms_24h", "mix_health"}
 
 
 def _device_snapshot_path() -> Path:
@@ -233,8 +236,7 @@ def _cached(key: str, ttl: int, producer: Callable[[], Any]) -> Any:
                 if entry:
                     return entry.value
         value = producer()
-        with _cache_lock:
-            _cache[key] = _CacheEntry(value=value)
+        cache_put(key, value)
         return value
 
     try:
@@ -243,8 +245,7 @@ def _cached(key: str, ttl: int, producer: Callable[[], Any]) -> Any:
             if entry and time.time() - entry.at < ttl:
                 return entry.value
         value = producer()
-        with _cache_lock:
-            _cache[key] = _CacheEntry(value=value)
+        cache_put(key, value)
         return value
     finally:
         prod_lock.release()
@@ -319,6 +320,91 @@ def cache_put(key: str, value: Any) -> None:
     """Write a cache entry (used by background refresh without clearing the UI first)."""
     with _cache_lock:
         _cache[key] = _CacheEntry(value=value)
+    if key in _NEON_SNAPSHOT_KEYS and isinstance(value, pd.DataFrame):
+        try:
+            neon_snapshot_store.save_frame(key, value)
+        except Exception as e:  # noqa: BLE001
+            log.debug("Neon snapshot save skipped for %s: %s", key, e)
+
+
+def _snapshot_max_age_seconds() -> float:
+    try:
+        hours = float(os.environ.get("NEON_SNAPSHOT_MAX_HOURS", "72") or "72")
+    except ValueError:
+        hours = 72.0
+    return max(1.0, hours) * 3600.0
+
+
+def _cache_from_neon_snapshot(key: str, *, ignore_max_age: bool = False) -> Any:
+    if key not in _NEON_SNAPSHOT_KEYS:
+        return None
+    try:
+        loaded = neon_snapshot_store.load_frame(key)
+    except Exception as e:  # noqa: BLE001
+        log.debug("Neon snapshot load skipped for %s: %s", key, e)
+        return None
+    if not loaded:
+        return None
+    value, updated_at = loaded
+    if not ignore_max_age:
+        age = max(0.0, time.time() - updated_at.timestamp())
+        if age > _snapshot_max_age_seconds():
+            log.warning("Neon snapshot %s ignored (%.1fh old)", key, age / 3600.0)
+            return None
+    with _cache_lock:
+        _cache[key] = _CacheEntry(value=value, at=updated_at.timestamp())
+    return value
+
+
+def hydrate_cache_from_neon() -> dict[str, int]:
+    """Load all dashboard snapshots from Neon into memory (ignore max-age TTL)."""
+    import operation_log
+
+    counts: dict[str, int] = {}
+    for key in sorted(_NEON_SNAPSHOT_KEYS):
+        val = _cache_from_neon_snapshot(key, ignore_max_age=True)
+        if isinstance(val, pd.DataFrame):
+            counts[key] = len(val)
+    if counts:
+        parts = [f"{k}={v}" for k, v in counts.items()]
+        operation_log.log_event(
+            "system",
+            "hydrate_neon",
+            "ok",
+            f"Loaded snapshots from Neon ({', '.join(parts)})",
+            detail={"counts": counts},
+        )
+    else:
+        operation_log.log_event(
+            "system",
+            "hydrate_neon",
+            "ok",
+            "No Neon snapshots found — click Refresh data to load",
+        )
+    return counts
+
+
+def cache_needs_hydration() -> bool:
+    """True when none of the Neon-backed cache keys are populated."""
+    with _cache_lock:
+        for key in _NEON_SNAPSHOT_KEYS:
+            if key in _cache:
+                return False
+    return True
+
+
+def seed_device_cache_from_snapshot() -> bool:
+    """Seed the device list from disk so the UI has a baseline immediately."""
+    if os.environ.get("DHL_SEED_DEVICES_FROM_SNAPSHOT", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    with _cache_lock:
+        if "dhl_devices" in _cache:
+            return False
+    snap = _load_device_snapshot_primary()
+    if snap is None or snap.empty:
+        return False
+    cache_put("dhl_devices", snap)
+    return True
 
 
 def cache_age_seconds(key: str) -> float | None:
@@ -334,9 +420,10 @@ def cache_get(key: str, ttl: int = TTL_SECONDS) -> Any:
     with _cache_lock:
         entry = _cache.get(key)
     if not entry:
-        return None
+        return _cache_from_neon_snapshot(key)
     if time.time() - entry.at >= ttl:
-        return None
+        snap = _cache_from_neon_snapshot(key)
+        return snap if snap is not None else None
     return entry.value
 
 
@@ -741,7 +828,7 @@ def _sync_mix_catalog_from_caches() -> None:
 
 
 def get_mix_health_cached() -> pd.DataFrame | None:
-    val = cache_peek("mix_health")
+    val = cache_get("mix_health")
     if not isinstance(val, pd.DataFrame):
         return None
     if invalidate_stale_mix_caches():
@@ -1303,3 +1390,13 @@ def cache_latest_data_iso() -> str | None:
     if latest is None:
         return None
     return datetime.fromtimestamp(latest).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def last_saved_refresh_display() -> dict[str, Any] | None:
+    """Last successful Refresh data time from Neon dashboard_meta."""
+    try:
+        import neon_meta_store
+
+        return neon_meta_store.last_refresh_display()
+    except Exception:  # noqa: BLE001
+        return None

@@ -8,6 +8,8 @@ import threading
 import time
 from contextlib import nullcontext
 
+import operation_log
+
 from data import (
     cache_get,
     load_alarms_last_24h,
@@ -19,6 +21,7 @@ from data import (
     refresh_mix_health,
     refresh_realtime_status,
     load_realtime_status,
+    seed_device_cache_from_snapshot,
 )
 from vss_client import (
     active_base_url,
@@ -27,11 +30,11 @@ from vss_client import (
     keepalive_ping,
     last_vss_error,
     last_vss_profile,
+    last_vss_token_source,
     refresh_token_if_expired,
     try_token_without_login,
     validate_or_renew_token,
     vss_no_login_mode,
-    _has_persisted_token,
 )
 
 log = logging.getLogger("dhl-flask")
@@ -59,10 +62,13 @@ def _prewarm_mix(*, stale_while_revalidate: bool) -> None:
     label = "background refresh" if stale_while_revalidate else "startup"
     try:
         log.info("prewarm: mix_health starting (%s)", label)
+        operation_log.log_event("mix_data", "fetch_mix_health", "running", f"MiX health fetch starting ({label})")
         load_fn()
         log.info("prewarm: mix_health done")
+        operation_log.log_event("mix_data", "fetch_mix_health", "ok", f"MiX health fetch complete ({label})")
     except Exception as e:  # noqa: BLE001
         log.warning("prewarm: mix_health failed: %s", e)
+        operation_log.log_event("mix_data", "fetch_mix_health", "error", f"MiX health fetch failed: {e}")
 
 
 def _prewarm_vss(*, keep_devices: bool, stale_while_revalidate: bool) -> None:
@@ -77,28 +83,14 @@ def _prewarm_vss(*, keep_devices: bool, stale_while_revalidate: bool) -> None:
             log.info("prewarm: VSS token %s... (reuse in-memory)", token[:12])
         else:
             try:
-                cached = try_token_without_login()
-                if cached:
-                    token, _pid = cached
-                    log.info(
-                        "prewarm: VSS token %s... (file/env) profile=%s base=%s",
-                        token[:12],
-                        last_vss_profile() or "?",
-                        active_base_url(),
-                    )
-                elif not _has_persisted_token():
-                    token, _pid = ensure_token(login_max_wait_seconds=120, allow_10082_retry=True)
-                    log.info(
-                        "prewarm: VSS login OK profile=%s base=%s token=%s...",
-                        last_vss_profile() or "?",
-                        active_base_url(),
-                        token[:12],
-                    )
-                else:
-                    log.warning(
-                        "prewarm: .vss_token.json exists but unreadable — fix token file or set VSS_ALLOW_API_LOGIN=1"
-                    )
-                    return
+                token, _pid = ensure_token(login_max_wait_seconds=120, allow_10082_retry=True)
+                log.info(
+                    "prewarm: VSS token %s... (%s) profile=%s base=%s",
+                    token[:12],
+                    last_vss_token_source() or "unknown",
+                    last_vss_profile() or "?",
+                    active_base_url(),
+                )
             except Exception as e:  # noqa: BLE001
                 err = last_vss_error() or str(e)
                 log.warning("prewarm: VSS token unavailable: %s", err)
@@ -119,20 +111,29 @@ def _prewarm_vss(*, keep_devices: bool, stale_while_revalidate: bool) -> None:
         if need_devices:
             try:
                 log.info("prewarm: dhl_devices starting")
+                operation_log.log_event("vss_data", "fetch_dhl_devices", "running", "VSS device list fetch starting")
                 load_devices()
                 log.info("prewarm: dhl_devices done")
+                operation_log.log_event("vss_data", "fetch_dhl_devices", "ok", "VSS device list fetch complete")
             except Exception as e:  # noqa: BLE001
                 log.warning("prewarm: dhl_devices failed: %s", e)
+                operation_log.log_event("vss_data", "fetch_dhl_devices", "error", f"VSS device list failed: {e}")
         else:
             log.info("prewarm: dhl_devices already cached")
 
-        for name, fn in (("realtime_status", load_realtime), ("alarms_last_24h", load_alarms)):
+        for name, fn, cache_key in (
+            ("realtime_status", load_realtime, "fetch_realtime"),
+            ("alarms_last_24h", load_alarms, "fetch_alarms"),
+        ):
             try:
                 log.info("prewarm: %s starting", name)
+                operation_log.log_event("vss_data", cache_key, "running", f"VSS {name} fetch starting")
                 fn()
                 log.info("prewarm: %s done", name)
+                operation_log.log_event("vss_data", cache_key, "ok", f"VSS {name} fetch complete")
             except Exception as e:  # noqa: BLE001
                 log.warning("prewarm: %s failed: %s", name, e)
+                operation_log.log_event("vss_data", cache_key, "error", f"VSS {name} failed: {e}")
 
 
 def _kick_mix_prewarm(*, stale_while_revalidate: bool = False) -> None:
@@ -193,46 +194,19 @@ def prewarm_cache(*, keep_devices: bool = False, stale_while_revalidate: bool = 
     _kick_vss_prewarm(keep_devices=keep_devices, stale_while_revalidate=stale_while_revalidate)
 
 
-def _keepalive_loop() -> None:
-    interval = max(60, KEEPALIVE_MINUTES * 60)
-    while True:
-        try:
-            time.sleep(interval)
-            ok = keepalive_ping(allow_reauth=False)
-            tok = get_current_token()
-            tok_str = (tok[0][:12] + "...") if tok else "(no token)"
-            log.info("keepalive: token %s alive=%s", tok_str, ok)
-        except Exception as e:  # noqa: BLE001
-            log.warning("keepalive: %s", e)
-
-
-def _token_refresh_loop() -> None:
-    interval = max(300, TOKEN_CHECK_MINUTES * 60)
-    while True:
-        try:
-            time.sleep(interval)
-            if refresh_token_if_expired():
-                log.info("token scheduler: proactive refresh completed")
-        except Exception as e:  # noqa: BLE001
-            log.warning("token scheduler: %s", e)
-
-
-def _auto_refresh_loop() -> None:
-    interval = max(60, REFRESH_MINUTES * 60)
-    while True:
-        try:
-            time.sleep(interval)
-            log.info("auto-refresh: busting caches (every %s min)", REFRESH_MINUTES)
-            from data import bust_cache_for_refresh
-
-            bust_cache_for_refresh(keep_devices=True)
-            prewarm_cache(keep_devices=True, stale_while_revalidate=True)
-        except Exception as e:  # noqa: BLE001
-            log.warning("auto-refresh: %s", e)
+def prewarm_cache_sync(*, keep_devices: bool = False, stale_while_revalidate: bool = False) -> None:
+    """Run prewarm in the current thread (manual Refresh data only)."""
+    _prewarm_mix(stale_while_revalidate=stale_while_revalidate)
+    _prewarm_vss(keep_devices=keep_devices, stale_while_revalidate=stale_while_revalidate)
 
 
 def start_background_workers() -> None:
-    prewarm_cache()
-    threading.Thread(target=_keepalive_loop, daemon=True, name="dhl-keepalive").start()
-    threading.Thread(target=_token_refresh_loop, daemon=True, name="dhl-token-refresh").start()
-    threading.Thread(target=_auto_refresh_loop, daemon=True, name="dhl-auto-refresh").start()
+    """Startup: hydrate display cache from Neon only — no VSS/MiX API calls."""
+    try:
+        from data import cache_needs_hydration, hydrate_cache_from_neon
+
+        if cache_needs_hydration():
+            hydrate_cache_from_neon()
+            log.info("startup: dashboard cache hydrated from Neon")
+    except Exception as e:  # noqa: BLE001
+        log.warning("startup Neon hydrate skipped: %s", e)

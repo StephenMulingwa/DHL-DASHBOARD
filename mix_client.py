@@ -24,6 +24,8 @@ from typing import Any
 import pandas as pd
 import requests
 
+import operation_log
+
 log = logging.getLogger(__name__)
 _REPO_DIR = Path(__file__).resolve().parent
 _session = requests.Session()
@@ -189,13 +191,19 @@ def ensure_bearer_token() -> str:
     }
     headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
     log.info("MiX: requesting bearer token from %s (user=%s)", token_url, creds["IdentityUsername"])
+    operation_log.log_event(
+        "mix_data", "oauth", "running", f"MiX OAuth starting ({_server_key()})",
+        detail={"server": _server_key(), "user": creds["IdentityUsername"]},
+    )
     resp = _session.post(token_url, data=payload, headers=headers, timeout=30)
     if resp.status_code != 200:
         detail = _mix_token_error_detail(resp)
-        raise RuntimeError(
+        msg = (
             f"MiX token request failed ({resp.status_code}): {detail}. "
             f"Check IdentityUsername/IdentityPassword in MIX_ACCOUNTS_JSON for {_server_key()}."
         )
+        operation_log.log_event("mix_data", "oauth", "error", msg)
+        raise RuntimeError(msg)
     data = resp.json()
     token = str(data["access_token"])
     expires_in = int(data.get("expires_in", 3600))
@@ -203,6 +211,13 @@ def ensure_bearer_token() -> str:
         _bearer_token = token
         _token_expires_at = time.time() + expires_in
     log.info("MiX: token acquired (valid ~%s min)", expires_in // 60)
+    operation_log.log_event(
+        "mix_data",
+        "oauth",
+        "ok",
+        f"MiX OAuth OK ({_server_key()}, valid ~{expires_in // 60} min)",
+        detail={"server": _server_key(), "expires_in": expires_in},
+    )
     return token
 
 

@@ -3,12 +3,29 @@
     return (text || '').toString().toLowerCase();
   }
 
+  function cellValue(row, colIdx) {
+    var cell = row.cells[colIdx];
+    if (!cell) return '';
+    return (cell.textContent || '').trim();
+  }
+
+  function compareValues(a, b, type) {
+    if (type === 'num') {
+      var na = parseFloat(String(a).replace(/,/g, ''));
+      var nb = parseFloat(String(b).replace(/,/g, ''));
+      if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+    }
+    return normalize(a).localeCompare(normalize(b), undefined, { numeric: true, sensitivity: 'base' });
+  }
+
   function initTable(root) {
     var table = root.querySelector('.report-data-table');
     if (!table || table.dataset.enhanced === '1') return;
     table.dataset.enhanced = '1';
 
-    var rows = Array.from(table.querySelectorAll('tbody tr'));
+    var tbody = table.querySelector('tbody');
+    var headers = Array.from(table.querySelectorAll('thead th'));
+    var rows = Array.from(tbody.querySelectorAll('tr'));
     var search = root.querySelector('.table-search');
     var pageSizeSelect = root.querySelector('.table-page-size');
     var prev = root.querySelector('.table-prev');
@@ -16,6 +33,8 @@
     var pageLabel = root.querySelector('.table-page-label');
     var count = root.querySelector('.table-count');
     var page = 1;
+    var sortCol = null;
+    var sortDir = 1;
 
     function pageSize() {
       var raw = pageSizeSelect ? parseInt(pageSizeSelect.value, 10) : parseInt(root.dataset.pageSize || '10', 10);
@@ -30,8 +49,17 @@
       });
     }
 
+    function applySort(list) {
+      if (sortCol === null) return list;
+      var type = headers[sortCol] && headers[sortCol].dataset.sortType === 'num' ? 'num' : 'text';
+      return list.slice().sort(function (ra, rb) {
+        var cmp = compareValues(cellValue(ra, sortCol), cellValue(rb, sortCol), type);
+        return cmp * sortDir;
+      });
+    }
+
     function render() {
-      var visible = filteredRows();
+      var visible = applySort(filteredRows());
       var size = pageSize();
       var pages = Math.max(1, Math.ceil(visible.length / size));
       page = Math.min(Math.max(page, 1), pages);
@@ -39,6 +67,7 @@
       var end = start + size;
 
       rows.forEach(function (row) {
+        tbody.appendChild(row);
         row.hidden = true;
       });
       visible.slice(start, end).forEach(function (row) {
@@ -54,6 +83,33 @@
         count.textContent = 'Showing ' + shownStart + '-' + shownEnd + ' of ' + visible.length + ' rows';
       }
     }
+
+    headers.forEach(function (th, idx) {
+      th.classList.add('sortable-th');
+      th.setAttribute('role', 'columnheader');
+      th.setAttribute('tabindex', '0');
+      if (idx === 0) th.dataset.sortType = 'num';
+      th.addEventListener('click', function () {
+        if (sortCol === idx) {
+          sortDir = sortDir * -1;
+        } else {
+          sortCol = idx;
+          sortDir = 1;
+        }
+        headers.forEach(function (h) {
+          h.classList.remove('sort-asc', 'sort-desc');
+        });
+        th.classList.add(sortDir > 0 ? 'sort-asc' : 'sort-desc');
+        page = 1;
+        render();
+      });
+      th.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          th.click();
+        }
+      });
+    });
 
     if (search) {
       search.addEventListener('input', function () {
@@ -85,6 +141,12 @@
   function initAll() {
     document.querySelectorAll('.report-table').forEach(initTable);
   }
+
+  function init(root) {
+    (root || document).querySelectorAll('.report-table').forEach(initTable);
+  }
+
+  window.DashboardTables = { init: init };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initAll);

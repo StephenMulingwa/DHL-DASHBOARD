@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.vss_token.txt
+.vss_token.json
+.mix_asset_catalog.csv
+accounts.json
+.venv/
+__pycache__/
+*.pyc
+.git/
+*.ipynb

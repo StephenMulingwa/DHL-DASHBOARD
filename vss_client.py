@@ -11,7 +11,6 @@ Credentials are read from environment variables; see .env.example / README.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import threading
@@ -20,11 +19,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 import requests
 from requests.adapters import HTTPAdapter
+
+import neon_token_store
+import operation_log
 
 
 def _env(name: str, default: str = "") -> str:
@@ -35,10 +36,6 @@ def _env(name: str, default: str = "") -> str:
 BASE_URL: str = _env("VSS_BASE_URL", "http://40.76.130.233:9966")
 USERNAME: str = _env("VSS_USERNAME", "mawa@controltech-ea.com")
 PASSWORD_PLAINTEXT: str = _env("VSS_PASSWORD", "Kenya+123")
-
-_TOKEN_FILE = Path(__file__).resolve().parent / ".vss_token.txt"
-_TOKEN_JSON_FILE = Path(__file__).resolve().parent / ".vss_token.json"
-
 
 @dataclass(frozen=True)
 class VssProfile:
@@ -134,9 +131,9 @@ def _ssl_verify_for_url(base_url: str) -> bool:
 
 def _token_ttl_hours() -> float:
     try:
-        return max(1.0, float(_env("VSS_TOKEN_TTL_HOURS", "23") or "23"))
+        return max(1.0, float(_env("VSS_TOKEN_TTL_HOURS", "22") or "22"))
     except ValueError:
-        return 23.0
+        return 22.0
 
 
 def _parse_issued_at(raw: str | int | float | None) -> datetime | None:
@@ -171,15 +168,6 @@ def _token_is_expired(issued_at: datetime | None) -> bool:
     return now - issued_at >= ttl
 
 
-def _token_file_mtime() -> float | None:
-    for path in (_TOKEN_JSON_FILE, _TOKEN_FILE):
-        if path.is_file():
-            try:
-                return path.stat().st_mtime
-            except OSError:
-                continue
-    return None
-
 _vss_log = logging.getLogger("vss_client")
 
 _POOL_MAXSIZE: int = int(_env("VSS_POOL_MAXSIZE", "50") or "50")
@@ -195,11 +183,8 @@ _discover_lock = threading.Lock()
 _VSS_TOKEN: str | None = None
 _VSS_PID: str | None = None
 _VSS_TOKEN_AT: datetime | None = None
-# Set inside ``ensure_token`` for debugging: memory / env / file / login.
+# Set inside ``ensure_token`` for debugging: memory / neon / env / login.
 _LAST_TOKEN_SOURCE: str | None = None
-# Mtime of ``.vss_token.txt`` when the in-memory token was last aligned with that file
-# (used to pick up hand-edited tokens without restarting the process).
-_FILE_TOKEN_MTIME: float | None = None
 _LAST_10082_AT: float | None = None
 
 
@@ -268,37 +253,40 @@ def _load_token_from_file() -> tuple[str, str] | None:
     return (rec.token, rec.pid) if rec else None
 
 
-def _load_token_record() -> _TokenRecord | None:
-    if _TOKEN_JSON_FILE.is_file():
-        try:
-            data = json.loads(_TOKEN_JSON_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                tok = str(data.get("token") or "").strip()
-                pid = str(data.get("pid") or "").strip()
-                issued_at = _parse_issued_at(data.get("issued_at"))
-                base_url = _normalize_base_url(str(data.get("base_url") or "")) or None
-                profile = str(data.get("profile") or "").strip() or None
-                if tok:
-                    return _TokenRecord(tok, pid, issued_at, base_url, profile)
-        except Exception:
-            pass
+def _load_token_from_neon() -> _TokenRecord | None:
+    row = neon_token_store.load_vss_token()
+    if not row:
+        return None
+    tok = str(row.get("token") or "").strip()
+    if not tok:
+        return None
+    return _TokenRecord(
+        tok,
+        str(row.get("pid") or "").strip(),
+        row.get("issued_at"),
+        _normalize_base_url(str(row.get("base_url") or "")) or None,
+        str(row.get("profile") or "").strip() or None,
+    )
 
-    if not _TOKEN_FILE.is_file():
+
+def _load_token_record() -> _TokenRecord | None:
+    if not neon_token_store.configured():
         return None
-    try:
-        lines = [ln.strip() for ln in _TOKEN_FILE.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        if not lines:
-            return None
-        parts = lines[0].split()
-        tok = parts[0].strip()
-        pid = parts[1].strip() if len(parts) > 1 else ""
-        if not pid and len(lines) > 1:
-            pid = lines[1].strip()
-        if not tok:
-            return None
-        return _TokenRecord(tok, pid, None, None, None)
-    except Exception:
-        return None
+    return _load_token_from_neon()
+
+
+def _token_record_source(rec: _TokenRecord | None) -> str:
+    if rec and neon_token_store.configured():
+        return "neon"
+    return "env"
+
+
+def _token_record_usable_without_login(rec: _TokenRecord | None) -> bool:
+    if rec is None:
+        return False
+    if _vss_no_login() or not _vss_credentials_in_env():
+        return True
+    return not _token_is_expired(rec.issued_at)
 
 
 def _save_token_to_file(
@@ -309,25 +297,20 @@ def _save_token_to_file(
     base_url: str | None = None,
     profile: str | None = None,
 ) -> None:
+    if not neon_token_store.configured():
+        raise RuntimeError("NEON_DB_URL is required for VSS token storage")
     when = issued_at or datetime.now(timezone.utc)
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
-    payload: dict[str, str] = {
-        "token": token,
-        "pid": pid,
-        "issued_at": when.isoformat(),
-    }
     store_base = base_url or active_base_url()
     store_profile = profile or _active_profile_name
-    if store_base:
-        payload["base_url"] = store_base
-    if store_profile:
-        payload["profile"] = store_profile
-    try:
-        _TOKEN_JSON_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        _TOKEN_FILE.write_text(f"{token} {pid}\n", encoding="utf-8")
-    except Exception:
-        pass
+    neon_token_store.save_vss_token(
+        token,
+        pid,
+        issued_at=when,
+        base_url=store_base,
+        profile=store_profile,
+    )
 
 
 def _login_and_persist(
@@ -340,11 +323,35 @@ def _login_and_persist(
     else:
         max_wait = int(float(_env("VSS_LOGIN_MAX_WAIT", "600") or "600"))
         max_wait = max(120, max_wait)
-    token, pid = login_with_backoff(max_wait_seconds=max_wait, allow_10082_retry=allow_10082_retry)
+    operation_log.log_event(
+        "vss_token", "apiLogin", "running", "VSS apiLogin starting",
+        detail={"profile": _active_profile_name or ""},
+    )
+    try:
+        token, pid = login_with_backoff(max_wait_seconds=max_wait, allow_10082_retry=allow_10082_retry)
+    except Exception as exc:
+        operation_log.log_event(
+            "vss_token", "apiLogin", "error", f"VSS apiLogin failed: {exc}",
+        )
+        raise
     now = datetime.now(timezone.utc)
     _save_token_to_file(token, pid, issued_at=now)
     _set_last_vss_error(None)
-    _vss_log.info("VSS token saved to .vss_token.json (profile=%s)", _active_profile_name or "?")
+    pid_display = (pid or "")[:12]
+    if pid and len(pid) > 12:
+        pid_display += "…"
+    operation_log.log_event(
+        "vss_token",
+        "apiLogin",
+        "ok",
+        f"VSS token generated (profile={_active_profile_name or '?'}, pid={pid_display or '—'})",
+        detail={
+            "profile": _active_profile_name or "",
+            "pid_prefix": (pid or "")[:12],
+            "token_prefix": token[:8] if token else "",
+        },
+    )
+    _vss_log.info("VSS token saved to Neon (profile=%s)", _active_profile_name or "?")
     return token, pid
 
 
@@ -383,7 +390,7 @@ def login_with_backoff(max_wait_seconds: int = 60, *, allow_10082_retry: bool = 
         wait = max(0.0, float(_env("VSS_10082_COOLDOWN_SEC", "600") or "600") - (time.time() - (_LAST_10082_AT or 0)))
         msg = (
             f"VSS login temporarily blocked after rate-limit (10082). "
-            f"Wait ~{int(wait)}s or paste a fresh token+pid into .vss_token.json."
+            f"Wait ~{int(wait)}s or refresh the token in Neon."
         )
         _set_last_vss_error(msg)
         raise RuntimeError(msg)
@@ -430,13 +437,13 @@ def login_with_backoff(max_wait_seconds: int = 60, *, allow_10082_retry: bool = 
             if status == 10082:
                 _mark_10082()
                 if (
-                    _load_token_from_file()
+                    _load_token_record()
                     and not _env_truthy("VSS_10082_RETRY_LOGIN")
                     and not allow_10082_retry
                 ):
                     msg = (
                         f"VSS login rate-limited (10082) on {profile.name}. "
-                        "Use stored .vss_token.json or wait ~10 min."
+                        "Use the stored Neon token or wait ~10 min."
                     )
                     _set_last_vss_error(msg)
                     raise RuntimeError(f"{msg} full={j}")
@@ -475,7 +482,7 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 def _has_persisted_token() -> bool:
-    return _TOKEN_JSON_FILE.is_file() or _TOKEN_FILE.is_file()
+    return _load_token_record() is not None
 
 
 def _stored_token_issued_at() -> datetime | None:
@@ -486,7 +493,7 @@ def _stored_token_issued_at() -> datetime | None:
 
 
 def _stored_token_within_ttl() -> bool:
-    """True when saved token+pid is still inside the 23h reuse window."""
+    """True when saved token+pid is still inside the configured reuse window."""
     issued_at = _stored_token_issued_at()
     if issued_at is None:
         return True
@@ -521,25 +528,30 @@ def vss_no_login_mode():
 
 
 def try_token_without_login() -> tuple[str, str] | None:
-    """Return a token from memory, env, or file without calling apiLogin."""
-    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE, _FILE_TOKEN_MTIME
+    """Return a token from memory or Neon without calling apiLogin."""
+    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE
 
     with _lock:
         if _VSS_TOKEN:
             _LAST_TOKEN_SOURCE = "memory"
             return _VSS_TOKEN, _VSS_PID or ""
 
+        if neon_token_store.configured():
+            rec = _load_token_record()
+            if rec:
+                return _apply_token_record(rec, source="neon")
+            return None
+
         env_tok = _env("VSS_TOKEN")
         env_pid = _env("VSS_PID")
         if env_tok:
             _LAST_TOKEN_SOURCE = "env"
-            _FILE_TOKEN_MTIME = None
             _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = env_tok, env_pid, datetime.now(timezone.utc)
             return _VSS_TOKEN, _VSS_PID or ""
 
         rec = _load_token_record()
         if rec:
-            return _apply_token_record(rec, source="file")
+            return _apply_token_record(rec, source=_token_record_source(rec))
     return None
 
 
@@ -548,27 +560,15 @@ def _apply_token_record(
     *,
     source: str,
 ) -> tuple[str, str]:
-    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE, _FILE_TOKEN_MTIME
+    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE
     global _active_base_url, _active_profile_name
     _LAST_TOKEN_SOURCE = source
     _VSS_TOKEN, _VSS_PID = rec.token, rec.pid
-    issued_at = rec.issued_at
-    mt = _token_file_mtime()
-    if mt is not None:
-        file_dt = datetime.fromtimestamp(mt, tz=timezone.utc)
-        if issued_at is None:
-            issued_at = file_dt
-        else:
-            if issued_at.tzinfo is None:
-                issued_at = issued_at.replace(tzinfo=timezone.utc)
-            if file_dt > issued_at + timedelta(seconds=2):
-                issued_at = file_dt
-    _VSS_TOKEN_AT = issued_at or datetime.now(timezone.utc)
+    _VSS_TOKEN_AT = rec.issued_at or datetime.now(timezone.utc)
     if rec.base_url:
         _active_base_url = rec.base_url
     if rec.profile:
         _active_profile_name = rec.profile
-    _FILE_TOKEN_MTIME = mt
     _set_last_vss_error(None)
     return _VSS_TOKEN, _VSS_PID or ""
 
@@ -580,10 +580,10 @@ def _memory_token_expired() -> bool:
 
 
 def refresh_token_if_expired(*, login_max_wait_seconds: int | None = None) -> bool:
-    """Proactively refresh stored token when age >= VSS_TOKEN_TTL_HOURS (default 23h)."""
-    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE, _FILE_TOKEN_MTIME
+    """Proactively refresh stored token when age >= VSS_TOKEN_TTL_HOURS (default 22h)."""
+    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE
 
-    if _env("VSS_TOKEN"):
+    if _env("VSS_TOKEN") and not neon_token_store.configured():
         return False
 
     with _lock:
@@ -605,10 +605,6 @@ def refresh_token_if_expired(*, login_max_wait_seconds: int | None = None) -> bo
         _LAST_TOKEN_SOURCE = "login"
         now = datetime.now(timezone.utc)
         _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = token, pid, now
-        try:
-            _FILE_TOKEN_MTIME = _TOKEN_JSON_FILE.stat().st_mtime
-        except OSError:
-            _FILE_TOKEN_MTIME = None
         _vss_log.info("VSS token refreshed proactively (TTL %.0fh)", _token_ttl_hours())
         return True
 
@@ -624,25 +620,17 @@ def ensure_token(
 
     Lookup order (when no in-memory token exists yet, or ``force=True``):
 
-      1) ``VSS_TOKEN`` env var
-      2) ``.vss_token.json`` / ``.vss_token.txt`` (preferred when present)
-      3) apiLogin via ``VSS_*`` / ``VSS_*_N`` profiles in ``.env`` (saved to json)
+      1) Neon ``vss_tokens`` when ``NEON_DB_URL`` is configured
+      2) ``VSS_TOKEN`` env var (only when Neon is not configured)
+      3) apiLogin via ``VSS_*`` / ``VSS_*_N`` profiles in ``.env`` (saved to Neon)
 
-    Set ``skip_file=True`` to force step 3 (used when stored token returns 10023).
+    Set ``skip_file=True`` to force apiLogin (used when stored token returns 10023).
     """
-    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE, _FILE_TOKEN_MTIME
+    global _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT, _LAST_TOKEN_SOURCE
 
     with _lock:
         # PID may be empty on some responses; token alone must still count as a session.
         if not force and _VSS_TOKEN:
-            mt = _token_file_mtime()
-            if _FILE_TOKEN_MTIME is not None and mt is not None:
-                try:
-                    if mt > _FILE_TOKEN_MTIME:
-                        _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = None, None, None
-                        _FILE_TOKEN_MTIME = None
-                except OSError:
-                    pass
             if _VSS_TOKEN and not _memory_token_expired():
                 _LAST_TOKEN_SOURCE = "memory"
                 return _VSS_TOKEN, _VSS_PID or ""
@@ -650,37 +638,40 @@ def ensure_token(
                 _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = None, None, None
 
         if force:
-            # Drop the stale in-memory token so a newly pasted env/file token can take over
-            # without forcing another apiLogin attempt.
+            # Drop the stale in-memory token so persisted storage can be checked again.
             _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = None, None, None
-            _FILE_TOKEN_MTIME = None
 
-        env_tok = _env("VSS_TOKEN")
-        env_pid = _env("VSS_PID")
-        if env_tok:
-            _LAST_TOKEN_SOURCE = "env"
-            _FILE_TOKEN_MTIME = None
-            _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = env_tok, env_pid, datetime.now(timezone.utc)
-            return _VSS_TOKEN, _VSS_PID or ""
+        if not neon_token_store.configured():
+            env_tok = _env("VSS_TOKEN")
+            env_pid = _env("VSS_PID")
+            if env_tok:
+                _LAST_TOKEN_SOURCE = "env"
+                _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = env_tok, env_pid, datetime.now(timezone.utc)
+                return _VSS_TOKEN, _VSS_PID or ""
 
         if not skip_file:
             rec = _load_token_record()
+            if rec and _token_record_usable_without_login(rec):
+                return _apply_token_record(rec, source=_token_record_source(rec))
             if rec:
-                return _apply_token_record(rec, source="file")
+                _vss_log.info(
+                    "Stored VSS token is older than %.0fh — apiLogin will refresh and overwrite storage",
+                    _token_ttl_hours(),
+                )
 
         if _vss_no_login():
             rec = _load_token_record()
             if rec:
-                return _apply_token_record(rec, source="file")
+                return _apply_token_record(rec, source=_token_record_source(rec))
             raise RuntimeError(
                 "VSS token not available for refresh (no apiLogin in refresh mode). "
-                "Paste a new token into .vss_token.json or restart the app."
+                "Wait for the next login/startup refresh or restart the app."
             )
 
         if not _vss_credentials_in_env():
             rec = _load_token_record()
             if rec:
-                return _apply_token_record(rec, source="file")
+                return _apply_token_record(rec, source=_token_record_source(rec))
             raise RuntimeError("No VSS credentials in .env (VSS_USERNAME/VSS_PASSWORD).")
 
         retry_login = allow_10082_retry or skip_file
@@ -691,15 +682,11 @@ def ensure_token(
         _LAST_TOKEN_SOURCE = "login"
         now = datetime.now(timezone.utc)
         _VSS_TOKEN, _VSS_PID, _VSS_TOKEN_AT = token, pid, now
-        try:
-            _FILE_TOKEN_MTIME = _TOKEN_JSON_FILE.stat().st_mtime
-        except OSError:
-            _FILE_TOKEN_MTIME = None
         return token, pid
 
 
 def last_vss_token_source() -> str | None:
-    """Where ``ensure_token()`` last took the token from: ``memory``, ``env``, ``file``, or ``login``."""
+    """Where ``ensure_token()`` last took the token from: ``memory``, ``neon``, ``env``, or ``login``."""
     return _LAST_TOKEN_SOURCE
 
 
@@ -749,7 +736,7 @@ def keepalive_ping(*, allow_reauth: bool = True) -> bool:
     its cached data for now.
 
     When ``allow_reauth`` is False (refresh / background keepalive), the same
-    in-memory token is pinged without reloading ``.vss_token.txt`` or calling
+    in-memory token is pinged without reloading persisted storage or calling
     apiLogin on 10023.
     """
     tok = _token_for_keepalive(allow_reauth=allow_reauth)
@@ -759,23 +746,24 @@ def keepalive_ping(*, allow_reauth: bool = True) -> bool:
     if _token_is_live(token):
         return True
     status = _token_api_status(token, "/vss/lang/findLangDict.action", {"terminal": 2, "lang": "en"})
-    if status == 10023:
-        if _vss_no_login() or not allow_reauth:
-            return False
-        try:
-            _vss_log.info("VSS stored token rejected (10023) — apiLogin via .env and saving .vss_token.json")
-            token2, _ = ensure_token(
-                force=True,
-                skip_file=True,
-                login_max_wait_seconds=120,
-                allow_10082_retry=True,
-            )
-            return _token_is_live(token2)
-        except RuntimeError:
-            return False
-    # A language-dictionary success is not enough: some expired sessions still
-    # pass that endpoint while fleet/device endpoints return 10023.
-    return False
+    if _vss_no_login() or not allow_reauth:
+        return False
+    try:
+        reason = (
+            f"data endpoint not live; lang status {status}"
+            if status is not None
+            else "no live data response"
+        )
+        _vss_log.info("VSS stored token rejected (%s) — apiLogin via .env and saving to Neon", reason)
+        token2, _ = ensure_token(
+            force=True,
+            skip_file=True,
+            login_max_wait_seconds=120,
+            allow_10082_retry=True,
+        )
+        return _token_is_live(token2)
+    except RuntimeError:
+        return False
 
 
 def validate_or_renew_token(*, allow_reauth: bool = True) -> tuple[bool, str]:
@@ -797,7 +785,7 @@ def validate_or_renew_token(*, allow_reauth: bool = True) -> tuple[bool, str]:
 
 
 def _retry_on_session_expired(call_fn):
-    """Run ``call_fn(token)``; on 10023 reload file token, then apiLogin from .env."""
+    """Run ``call_fn(token)``; on 10023 reload stored token, then apiLogin from .env."""
     token, _ = ensure_token()
     try:
         return call_fn(token)
@@ -819,7 +807,7 @@ def _retry_on_session_expired(call_fn):
                 pass
             if not _vss_credentials_in_env() or _login_cooldown_active():
                 err = (
-                    "VSS session expired (10023). Paste a fresh token+pid into .vss_token.json "
+                    "VSS session expired (10023). Refresh the stored token in Neon "
                     "or wait for login rate-limit to clear."
                 )
                 _set_last_vss_error(err)

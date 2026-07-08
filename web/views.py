@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from html import escape
+import os
+import re
 from typing import Any
 
 import pandas as pd
@@ -16,6 +18,11 @@ from data import (
     get_mix_health_cached,
     get_realtime_cached,
     last_mix_error,
+    last_saved_refresh_display,
+    load_alarms_last_24h,
+    load_dhl_devices,
+    load_mix_health,
+    load_realtime_status,
     mix_integration_enabled,
     parse_channels,
 )
@@ -24,6 +31,50 @@ from web.charts import figure_html
 
 DHL_RED = C.DHL_RED
 DHL_YELLOW = C.DHL_YELLOW
+
+
+def _sync_load_on_page() -> bool:
+    return os.environ.get("DHL_SYNC_LOAD_ON_PAGE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _devices_df() -> pd.DataFrame | None:
+    df = get_dhl_devices_cached()
+    if df is not None or not _sync_load_on_page():
+        return df
+    try:
+        return load_dhl_devices()
+    except Exception:
+        return get_dhl_devices_cached()
+
+
+def _realtime_df() -> pd.DataFrame | None:
+    df = get_realtime_cached()
+    if df is not None or not _sync_load_on_page():
+        return df
+    try:
+        return load_realtime_status()
+    except Exception:
+        return get_realtime_cached()
+
+
+def _alarms_df() -> pd.DataFrame | None:
+    df = get_alarms_cached()
+    if df is not None or not _sync_load_on_page():
+        return df
+    try:
+        return load_alarms_last_24h()
+    except Exception:
+        return get_alarms_cached()
+
+
+def _mix_df() -> pd.DataFrame | None:
+    df = get_mix_health_cached()
+    if df is not None or not _sync_load_on_page():
+        return df
+    try:
+        return load_mix_health()
+    except Exception:
+        return get_mix_health_cached()
 
 
 def kpi_dict(
@@ -56,8 +107,20 @@ def df_to_table_html(
     if "AlarmTime" in out.columns:
         out = out.assign(AlarmTime=lambda d: pd.to_datetime(d["AlarmTime"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S"))
     out = out.fillna("")
-    display = out.head(max_rows)
+    display = out.head(max_rows).reset_index(drop=True)
+    display.insert(0, "#", range(1, len(display) + 1))
     table = display.to_html(classes="data-table report-data-table", index=False, border=0, escape=True)
+    table = table.replace("<thead>", '<thead class="sortable-head">', 1)
+    table = re.sub(
+        r"<th>",
+        '<th class="sortable-th" role="columnheader" tabindex="0">',
+        table,
+    )
+    table = table.replace(
+        '<th class="sortable-th" role="columnheader" tabindex="0">',
+        '<th class="sortable-th sort-num" role="columnheader" tabindex="0" data-sort-type="num">',
+        1,
+    )
     shown = len(display)
     total = len(out)
     clipped = total > shown
@@ -146,10 +209,26 @@ def _filter_alarms(df: pd.DataFrame | None, *, fleets: list[str], alarm_types: l
     return out
 
 
+def _normalize_alarm_frame(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Restore dtypes lost when alarm snapshots are serialized to JSON."""
+    if df is None:
+        return None
+    out = df.copy()
+    if "AlarmTime" in out.columns:
+        out["AlarmTime"] = pd.to_datetime(out["AlarmTime"], errors="coerce")
+    for col in ("Lat", "Lon", "Speed"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    for col in ("DeviceID", "DeviceName", "Fleet", "AlarmCode", "AlarmName", "PlateNo"):
+        if col in out.columns:
+            out[col] = out[col].fillna("").astype(str)
+    return out
+
+
 def _fleet_options(*, df: pd.DataFrame | None = None) -> list[str]:
     if df is not None and not df.empty and "Fleet" in df.columns:
         return sorted({str(x) for x in df["Fleet"].dropna() if str(x).strip()})
-    devices = get_dhl_devices_cached()
+    devices = _devices_df()
     if devices is not None and not devices.empty and "Fleet" in devices.columns:
         return sorted({str(x) for x in devices["Fleet"].dropna() if str(x).strip()})
     return []
@@ -170,6 +249,7 @@ def nav_items(*, active: str, mix_enabled: bool) -> list[dict]:
         {"id": "realtime", "label": "Real-Time Status", "href": "/dashboard/realtime", "icon": "radio"},
         {"id": "alarms", "label": "Alarms (24h)", "href": "/dashboard/alarms", "icon": "bell"},
         {"id": "device", "label": "Device Drilldown", "href": "/dashboard/device", "icon": "search"},
+        {"id": "logs", "label": "Logs", "href": "/dashboard/logs", "icon": "document"},
     ]
     if mix_enabled:
         items.insert(1, {"id": "mix", "label": "MiX Health", "href": "/dashboard/mix", "icon": "satellite"})
@@ -178,21 +258,41 @@ def nav_items(*, active: str, mix_enabled: bool) -> list[dict]:
     return items
 
 
+def logs_context() -> dict[str, Any]:
+    import operation_log
+
+    sessions = operation_log.fetch_sessions(limit=15)
+    return {
+        "title": "Pipeline Logs",
+        "subtitle": "Sessions grouped by login and Refresh data runs.",
+        "sessions": sessions,
+        "latest_id": operation_log.latest_event_id(),
+        "active_session_id": "",
+    }
+
+
+def db_data_banner() -> str:
+    """Banner text showing last saved refresh time from Neon."""
+    info = last_saved_refresh_display()
+    if info and info.get("at_display"):
+        return f"Showing data last refreshed {info['at_display']} (EAT) — click Refresh data to update."
+    return "Showing last saved data from database — click Refresh data to update."
+
+
 def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
-    devices = get_dhl_devices_cached()
-    rt = get_realtime_cached()
-    alarms = get_alarms_cached()
+    devices = _devices_df()
+    rt = _realtime_df()
+    alarms = _alarms_df()
 
     banners: list[str] = []
     vss_err = last_vss_error()
-    if vss_err and rt is None:
+    has_any_data = devices is not None or rt is not None or alarms is not None
+    if has_any_data:
+        banners.append(db_data_banner())
+    elif vss_err:
         banners.append(f"VSS connection issue: {vss_err}")
-    elif devices is None and rt is None and alarms is None:
-        banners.append("Loading data from VSS — charts will appear when each dataset finishes.")
-    elif alarms is None and (devices is not None or rt is not None):
-        banners.append("24h alarms still loading.")
-    elif rt is None and devices is not None:
-        banners.append("Live status still loading — device list is ready.")
+    else:
+        banners.append("No saved data in database yet — click Refresh data to load from VSS and MiX.")
 
     total_devices = len(devices) if devices is not None else 0
     if rt is None or rt.empty:
@@ -216,7 +316,7 @@ def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
     ]
 
     if mix_integration_enabled():
-        mix_df = get_mix_health_cached()
+        mix_df = _mix_df()
         if mix_df is None:
             kpis.append(kpi_dict("MiX assets", "…", accent="#F59E0B", sub="loading"))
         elif mix_df.empty:
@@ -258,7 +358,7 @@ def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
 
     return {
         "title": "Fleet Overview",
-        "subtitle": "Live snapshot of DHL fleet health — devices, status, and alarms.",
+        "subtitle": "Live snapshot of fleet health — devices, status, and alarms.",
         "banners": banners,
         "kpis": kpis,
         "charts": charts,
@@ -275,7 +375,7 @@ def realtime_context(
     ch_filter: str = "all",
     chart: str = "online_pie",
 ) -> dict[str, Any]:
-    df = get_realtime_cached()
+    df = _realtime_df()
     fleets = _parse_multi(fleets)
     statuses = _parse_multi(statuses)
     ignitions = _parse_multi(ignitions)
@@ -292,14 +392,14 @@ def realtime_context(
         fleet_opts = _fleet_options()
 
     if df is None:
-        devices = get_dhl_devices_cached()
+        devices = _devices_df()
         dev_count = len(devices) if devices is not None else 0
         kpis = [
             kpi_dict("Devices (cached)", f"{dev_count:,}", border_accent="#3B82F6"),
         ] if dev_count else []
         return {
             "title": "Real-Time Device Status",
-            "subtitle": "Most recent reported state for every DHL device.",
+            "subtitle": "Most recent reported state for every tracked device.",
             "loading": True,
             "kpis": kpis,
             "chart_html": _vss_unavailable_fig("Fetching live device status"),
@@ -359,7 +459,7 @@ def realtime_context(
 
     return {
         "title": "Real-Time Device Status",
-        "subtitle": "Most recent reported state for every DHL device.",
+        "subtitle": "Most recent reported state for every tracked device.",
         "loading": False,
         "kpis": kpis,
         "chart_html": figure_html(fig),
@@ -382,7 +482,7 @@ def alarms_context(
     alarm_types: list[str] | None = None,
     chart: str = "type_pie",
 ) -> dict[str, Any]:
-    df = get_alarms_cached()
+    df = _normalize_alarm_frame(_alarms_df())
     fleets = _parse_multi(fleets)
     alarm_types = _parse_multi(alarm_types)
 
@@ -397,7 +497,7 @@ def alarms_context(
     if df is None:
         return {
             "title": "Alarms — Last 24 hours",
-            "subtitle": "Every alarm event raised across the DHL fleet.",
+            "subtitle": "Every alarm event raised across the monitored fleet.",
             "loading": True,
             "kpis": [],
             "chart_html": _vss_unavailable_fig("Fetching alarms"),
@@ -436,7 +536,7 @@ def alarms_context(
     table_cols = ["AlarmTime", "DeviceName", "DeviceID", "Fleet", "AlarmName", "Speed", "PlateNo", "Lat", "Lon"]
     return {
         "title": "Alarms — Last 24 hours",
-        "subtitle": "Every alarm event raised across the DHL fleet.",
+        "subtitle": "Every alarm event raised across the monitored fleet.",
         "loading": False,
         "kpis": kpis,
         "chart_html": figure_html(fig),
@@ -450,9 +550,9 @@ def alarms_context(
 
 
 def device_context(*, device_id: str | None = None) -> dict[str, Any]:
-    rt_df = get_realtime_cached()
-    devices = get_dhl_devices_cached()
-    alarms = get_alarms_cached()
+    rt_df = _realtime_df()
+    devices = _devices_df()
+    alarms = _normalize_alarm_frame(_alarms_df())
 
     options: list[dict] = []
     if rt_df is not None and not rt_df.empty:
@@ -590,12 +690,12 @@ def mix_context(*, issues: list[str] | None = None) -> dict[str, Any]:
             "issues": issues,
         }
 
-    df = get_mix_health_cached()
+    df = _mix_df()
     mix_err = last_mix_error()
     if df is None:
         return {
             "title": "MiX Telematics",
-            "subtitle": "DHL assets on MiX — health flags and diagnostics.",
+            "subtitle": "Assets on MiX — health flags and diagnostics.",
             "enabled": True,
             "notice": mix_err or "",
             "loading": not mix_err,
@@ -647,7 +747,7 @@ def mix_context(*, issues: list[str] | None = None) -> dict[str, Any]:
     show_cols = [c for c in ["AssetName", "Registration", "IssueCount", "Issues", "LastSeen"] if c in f.columns]
     return {
         "title": "MiX Telematics",
-        "subtitle": "DHL assets on MiX — health flags and diagnostics.",
+        "subtitle": "Assets on MiX — health flags and diagnostics.",
         "enabled": True,
         "notice": "",
         "loading": False,

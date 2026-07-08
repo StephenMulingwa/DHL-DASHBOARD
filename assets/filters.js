@@ -16,7 +16,10 @@
     });
   }
 
-  document.querySelectorAll('.filter-multi').forEach(function (wrap) {
+  function init(root) {
+    (root || document).querySelectorAll('.filter-multi').forEach(function (wrap) {
+      if (wrap.dataset.filterEnhanced === '1') return;
+      wrap.dataset.filterEnhanced = '1';
     var toggle = wrap.querySelector('.filter-multi-toggle');
     var menu = wrap.querySelector('.filter-multi-menu');
     var summary = wrap.querySelector('.filter-multi-summary');
@@ -40,9 +43,21 @@
       toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
     });
   });
+  }
 
-  document.addEventListener('click', function (e) {
-    if (e.target.closest('.filter-multi')) return;
-    closeAll(null);
-  });
+  if (!window.__dashboardFiltersDocumentBound) {
+    window.__dashboardFiltersDocumentBound = true;
+    document.addEventListener('click', function (e) {
+      if (e.target.closest('.filter-multi')) return;
+      closeAll(null);
+    });
+  }
+
+  window.DashboardFilters = { init: init };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { init(document); });
+  } else {
+    init(document);
+  }
 })();

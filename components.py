@@ -22,23 +22,74 @@ CHART_SLATE = "#64748B"
 COLORWAY = [CHART_BLUE, DHL_RED, CHART_GREEN, DHL_YELLOW, CHART_PURPLE, CHART_ORANGE, CHART_CYAN, CHART_SLATE]
 
 DEFAULT_LAYOUT = dict(
-    margin=dict(l=42, r=26, t=68, b=52),
+    margin=dict(l=48, r=32, t=72, b=48),
     paper_bgcolor="#FFFFFF",
-    plot_bgcolor="#FFFFFF",
+    plot_bgcolor="#FAFBFC",
     colorway=COLORWAY,
     font=dict(family="Inter, Segoe UI, Arial, sans-serif", size=12, color="#334155"),
-    title_font=dict(size=17, color="#0F172A"),
+    title_font=dict(size=16, color="#0F172A", family="Inter, Segoe UI, Arial, sans-serif"),
     legend=dict(
         orientation="h",
         yanchor="bottom",
-        y=1.04,
-        xanchor="right",
-        x=1,
+        y=1.02,
+        xanchor="left",
+        x=0,
         font=dict(size=11),
-        itemwidth=30,
+        bgcolor="rgba(255,255,255,0.8)",
     ),
     hoverlabel=dict(bgcolor="#0F172A", font=dict(color="#FFFFFF", size=12)),
 )
+
+_AXIS_LAYOUT = dict(
+    xaxis=dict(showgrid=True, gridcolor="#E2E8F0", linecolor="#CBD5E1", zeroline=False),
+    yaxis=dict(showgrid=True, gridcolor="#E2E8F0", linecolor="#CBD5E1", zeroline=False),
+)
+
+
+def _chart_title(text: str) -> dict:
+    return dict(
+        text=f"<b>{text}</b>",
+        x=0.02,
+        xanchor="left",
+        y=0.98,
+        yanchor="top",
+        font=dict(size=16, color="#0F172A", family="Inter, Segoe UI, Arial, sans-serif"),
+    )
+
+
+def _pie_layout(title: str) -> dict:
+    base = dict(DEFAULT_LAYOUT)
+    base.update(_AXIS_LAYOUT)
+    base.update(
+        title=_chart_title(title),
+        margin=dict(l=16, r=140, t=64, b=16),
+        showlegend=True,
+        legend=dict(
+            orientation="v",
+            yanchor="middle",
+            y=0.5,
+            xanchor="left",
+            x=1.01,
+            font=dict(size=11),
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor="#E2E8F0",
+            borderwidth=1,
+        ),
+    )
+    return base
+
+
+def _bar_layout(title: str, *, x_title: str = "", y_title: str = "", showlegend: bool = False) -> dict:
+    base = dict(DEFAULT_LAYOUT)
+    base.update(_AXIS_LAYOUT)
+    base.update(
+        title=_chart_title(title),
+        margin=dict(l=56, r=28, t=72, b=56),
+        showlegend=showlegend,
+        xaxis_title=x_title,
+        yaxis_title=y_title,
+    )
+    return base
 
 EMPTY_FIG = go.Figure().update_layout(
     **DEFAULT_LAYOUT,
@@ -99,10 +150,8 @@ def online_offline_pie(rt_df: pd.DataFrame, age_hours_threshold: float) -> go.Fi
         color_discrete_map={"Online": "#2E8B57", "Offline": DHL_RED, "Status Unknown": "#999"},
     )
     fig.update_traces(textposition="inside", textinfo="percent+label", marker=dict(line=dict(color="#FFFFFF", width=2)))
-    fig.update_layout(
-        **DEFAULT_LAYOUT,
-        title=f"Online vs Offline (Online = last seen <= {age_hours_threshold}h)",
-    )
+    fig.update_layout(**_pie_layout(f"Online vs Offline (Online = last seen ≤ {age_hours_threshold}h)"))
+    fig.update_layout(uniformtext_minsize=10, uniformtext_mode="hide")
     return fig
 
 
@@ -112,7 +161,8 @@ def status_type_donut(rt_df: pd.DataFrame) -> go.Figure:
     counts = rt_df["StatusType"].fillna("Status Unknown").value_counts()
     fig = px.pie(names=counts.index, values=counts.values, hole=0.6)
     fig.update_traces(textposition="inside", textinfo="percent+label", marker=dict(line=dict(color="#FFFFFF", width=2)))
-    fig.update_layout(**DEFAULT_LAYOUT, title="Detailed StatusType distribution")
+    fig.update_layout(**_pie_layout("Detailed StatusType distribution"))
+    fig.update_layout(uniformtext_minsize=10, uniformtext_mode="hide")
     return fig
 
 
@@ -152,7 +202,7 @@ def module_health_bar(rt_df: pd.DataFrame) -> go.Figure:
         barmode="stack",
         color_discrete_map={"Working": "#2E8B57", "Not Working": DHL_RED, "Unknown": "#999"},
     )
-    fig.update_layout(**DEFAULT_LAYOUT, title="Module health (Working vs Not Working)")
+    fig.update_layout(**_bar_layout("Module health (Working vs Not Working)", showlegend=True))
     return fig
 
 
@@ -206,7 +256,7 @@ def channel_health_bar(
             "Camera covered": DHL_YELLOW,
         },
     )
-    fig.update_layout(**DEFAULT_LAYOUT, title="Camera channel health (video lost vs covered, per device)")
+    fig.update_layout(**_bar_layout("Camera channel health (video lost vs covered, per device)", showlegend=True))
     return fig
 
 
@@ -218,11 +268,11 @@ def age_hours_histogram(rt_df: pd.DataFrame) -> go.Figure:
         return EMPTY_FIG
     fig = px.histogram(s, nbins=40, color_discrete_sequence=[DHL_RED])
     fig.update_layout(
-        **DEFAULT_LAYOUT,
-        title="How stale is the latest status? (hours since last report)",
-        xaxis_title="AgeHours",
-        yaxis_title="Devices",
-        showlegend=False,
+        **_bar_layout(
+            "How stale is the latest status? (hours since last report)",
+            x_title="Age (hours)",
+            y_title="Devices",
+        ),
     )
     return fig
 
@@ -236,7 +286,7 @@ def signal_box_by_status(rt_df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return EMPTY_FIG
     fig = px.box(df, x="StatusType", y="signalValue", color="StatusType", points="suspectedoutliers")
-    fig.update_layout(**DEFAULT_LAYOUT, title="Mobile signal by StatusType", showlegend=False)
+    fig.update_layout(**_bar_layout("Mobile signal by StatusType"))
     return fig
 
 
@@ -250,12 +300,12 @@ def top_fleets_by_faults(rt_df: pd.DataFrame, *, age_hours_threshold: float, top
     counts = faulty["Fleet"].fillna("Unknown").value_counts().head(top_n)
     fig = px.bar(x=counts.values, y=counts.index, orientation="h", color_discrete_sequence=[DHL_RED])
     fig.update_layout(
-        **DEFAULT_LAYOUT,
-        title=f"Top {top_n} fleets by faulty devices",
-        xaxis_title="Devices with fault",
-        yaxis_title="",
-        yaxis=dict(autorange="reversed"),
+        **_bar_layout(
+            f"Top {top_n} fleets by faulty devices",
+            x_title="Devices with fault",
+        ),
     )
+    fig.update_yaxes(autorange="reversed")
     return fig
 
 
@@ -267,7 +317,8 @@ def alarm_type_pie(alarms_df: pd.DataFrame) -> go.Figure:
     counts = alarms_df["AlarmName"].fillna("Unknown").value_counts()
     fig = px.pie(names=counts.index, values=counts.values, hole=0.45)
     fig.update_traces(textposition="inside", textinfo="percent+label", marker=dict(line=dict(color="#FFFFFF", width=2)))
-    fig.update_layout(**DEFAULT_LAYOUT, title="Alarms by type (last 24h)")
+    fig.update_layout(**_pie_layout("Alarms by type (last 24h)"))
+    fig.update_layout(uniformtext_minsize=10, uniformtext_mode="hide")
     return fig
 
 
@@ -280,7 +331,7 @@ def alarms_per_hour_line(alarms_df: pd.DataFrame) -> go.Figure:
     df["Hour"] = df["AlarmTime"].dt.floor("h")
     grouped = df.groupby(["Hour", "AlarmName"]).size().reset_index(name="Count")
     fig = px.area(grouped, x="Hour", y="Count", color="AlarmName")
-    fig.update_layout(**DEFAULT_LAYOUT, title="Alarms per hour (last 24h)", xaxis_title="", yaxis_title="Alarms")
+    fig.update_layout(**_bar_layout("Alarms per hour (last 24h)", x_title="Hour", y_title="Alarms", showlegend=True))
     return fig
 
 
@@ -296,12 +347,12 @@ def top_devices_by_alarms(alarms_df: pd.DataFrame, *, top_n: int = 20) -> go.Fig
     counts["Label"] = counts["DeviceName"].fillna("") + "  (" + counts["DeviceID"].astype(str) + ")"
     fig = px.bar(counts, x="Alarms", y="Label", orientation="h", color_discrete_sequence=[DHL_RED])
     fig.update_layout(
-        **DEFAULT_LAYOUT,
-        title=f"Top {top_n} devices by alarm count",
-        xaxis_title="Alarms",
-        yaxis_title="",
-        yaxis=dict(autorange="reversed"),
+        **_bar_layout(
+            f"Top {top_n} devices by alarm count",
+            x_title="Alarms",
+        ),
     )
+    fig.update_yaxes(autorange="reversed", tickfont=dict(size=11))
     return fig
 
 
@@ -323,7 +374,7 @@ def fleet_alarm_heatmap(alarms_df: pd.DataFrame) -> go.Figure:
         aspect="auto",
         text_auto=True,
     )
-    fig.update_layout(**DEFAULT_LAYOUT, title="Fleet x Alarm Type (heatmap)", xaxis_title="", yaxis_title="")
+    fig.update_layout(**_bar_layout("Fleet × Alarm Type (heatmap)", showlegend=False))
     return fig
 
 
@@ -380,13 +431,16 @@ def mix_positions_map(pos_df: pd.DataFrame) -> go.Figure:
         },
         zoom=5,
     )
-    fig.update_layout(
-        **DEFAULT_LAYOUT,
-        title="MiX asset locations (tacho speed)",
+    layout = dict(DEFAULT_LAYOUT)
+    layout.update(_AXIS_LAYOUT)
+    layout.update(
+        title=_chart_title("MiX asset locations (tacho speed)"),
         map_style="open-street-map" if hasattr(px, "scatter_map") else None,
         mapbox_style="open-street-map" if not hasattr(px, "scatter_map") else None,
         height=600,
+        margin=dict(l=0, r=0, t=64, b=0),
     )
+    fig.update_layout(**layout)
     return fig
 
 
@@ -415,11 +469,14 @@ def alarm_map(alarms_df: pd.DataFrame) -> go.Figure:
         hover_data={"AlarmTime": True, "Fleet": True, "Speed": True, "Lat": False, "Lon": False},
         zoom=5,
     )
-    fig.update_layout(
-        **DEFAULT_LAYOUT,
-        title="Alarm locations (last 24h)",
+    layout = dict(DEFAULT_LAYOUT)
+    layout.update(_AXIS_LAYOUT)
+    layout.update(
+        title=_chart_title("Alarm locations (last 24h)"),
         map_style="open-street-map" if hasattr(px, "scatter_map") else None,
         mapbox_style="open-street-map" if not hasattr(px, "scatter_map") else None,
         height=600,
+        margin=dict(l=0, r=0, t=64, b=0),
     )
+    fig.update_layout(**layout)
     return fig

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}{{ title }} · DHL Fleet Health{% endblock %}</title>
+  <title>{% block title %}{{ title }} · VSS MiX Fleet Health{% endblock %}</title>
   <link rel="icon" type="image/png" href="{{ url_for('static', filename='dhl_logo.png') }}">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -13,6 +13,7 @@
   <script src="{{ url_for('static', filename='filters.js') }}" defer></script>
   <script src="{{ url_for('static', filename='tables.js') }}" defer></script>
   <script src="{{ url_for('static', filename='sidebar.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='dashboard-nav.js') }}" defer></script>
   {% block head_extra %}{% endblock %}
 </head>
 <body{% if awaiting_vss %} data-awaiting-realtime="1"{% endif %}>
@@ -49,16 +50,13 @@
         const r = await fetch('/api/cache/status');
         if (!r.ok) return;
         const data = await r.json();
-        const el = document.getElementById('cache-status');
-        if (el && data.latest_data) {
-          el.textContent = 'Data updated ' + data.latest_data;
-        }
-        if (data.freshness && data.freshness.realtime_status && data.freshness.realtime_status !== 'not loaded' && window.__dhlAwaitingRealtime) {
-          window.location.reload();
+        if (data.freshness && data.freshness.realtime_status && data.freshness.realtime_status !== 'not loaded' && window.__fleetAwaitingRealtime) {
+          window.dashboardClearPageCache?.();
+          window.dashboardNavigateTo?.(window.location.href, { force: true, updateHistory: false });
         }
       } catch (_) {}
     }
-    window.__dhlAwaitingRealtime = document.body.dataset.awaitingRealtime === '1';
+    window.__fleetAwaitingRealtime = document.body.dataset.awaitingRealtime === '1';
     refreshCacheStatus();
     setInterval(refreshCacheStatus, {{ ui_poll_ms }});
 
@@ -67,11 +65,39 @@
       btn.disabled = true;
       btn.textContent = 'Refreshing…';
       try {
-        await fetch('/api/refresh', { method: 'POST' });
-        setTimeout(() => window.location.reload(), 1500);
-      } catch (_) {
+        const r = await fetch('/api/refresh', { method: 'POST' });
+        const data = r.ok ? await r.json().catch(() => ({})) : {};
+        if (!r.ok || data.ok === false) {
+          alert(data.error || 'Refresh failed. Check the Logs tab for details.');
+          btn.disabled = false;
+          btn.textContent = 'Refresh data';
+          return;
+        }
+        window.dashboardClearPageCache?.();
+        if (window.dashboardNavigateTo) {
+          window.dashboardNavigateTo(window.location.href, { force: true, updateHistory: false });
+        } else {
+          window.location.reload();
+        }
         btn.disabled = false;
         btn.textContent = 'Refresh data';
+      } catch (_) {
+        alert('Refresh failed — network error.');
+        btn.disabled = false;
+        btn.textContent = 'Refresh data';
+      }
+    });
+
+    document.getElementById('btn-signout')?.addEventListener('click', async function () {
+      const btn = this;
+      btn.disabled = true;
+      btn.textContent = 'Signing out…';
+      try {
+        const r = await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+        const data = r.ok ? await r.json() : {};
+        window.location.replace(data.redirect || '/login');
+      } catch (_) {
+        window.location.replace('/login');
       }
     });
   </script>
